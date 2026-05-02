@@ -1,0 +1,42 @@
+listen: ":8080"
+
+admin:
+  listen: ":9090"
+
+sources:
+  - name: public
+    type: http
+    listen: ":8080"
+    allowed_topics: ["info.*", "alert.*", "noisy.*"]
+
+sinks:
+  - name: console
+    type: stdout
+  - name: log
+    type: file
+    path: ./notrouter.log
+  - name: hook
+    type: webhook
+    url: "http://127.0.0.1:9999/"
+    auth_token: "outbound-tok"
+    hmac_secret: "topsecret"
+    hmac_header: "X-Hub-Signature-256"
+    template: '{"text":"[{{.Severity}}] {{.Topic}}: {{.Message}}"}'
+    content_type: "application/json"
+    max_retries: 2
+
+routes:
+  - topic: "alert.*"
+    dedup_window: "30s"
+    sinks: [console, log, hook]
+  - topic: "*"
+    min_severity: "error"
+    rate_per_sec: 5
+    rate_burst: 5
+    sinks: [hook]
+  - topic: "info.*"
+    sinks: [console]
+  - topic: "noisy.*"
+    group_window: "2s"
+    group_by: "{{.Topic}}"
+    sinks: [console]
