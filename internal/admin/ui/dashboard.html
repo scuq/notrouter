@@ -13,11 +13,12 @@
       <nav class="nav">
         <a href="/admin/ui/" class="active">overview</a>
         <a href="/admin/ui/config">config</a>
+        <a href="/admin/ui/logs">logs</a>
         {{ range $k, $v := .Links }}<a href="{{ $v }}" target="_blank" rel="noopener">{{ $k }}</a>{{ end }}
         <a href="/admin/ui/change-password">change password</a>
         <form method="POST" action="/admin/api/logout" style="display:inline; margin:0;">
           <input type="hidden" name="csrf" value="{{ .CSRF }}">
-          <button type="submit" style="all:unset; cursor:pointer; color:#007a1f; letter-spacing:1.5px; text-transform:uppercase; font-size:.75rem;" onmouseover="this.style.color='#00ff41'" onmouseout="this.style.color='#007a1f'">logout</button>
+          <button type="submit" style="all:unset; cursor:pointer; color:#1ea53a; letter-spacing:1.5px; text-transform:uppercase; font-size:.82rem; text-shadow: 0 0 3px rgba(30, 165, 58, .25);" onmouseover="this.style.color='#00ff41'" onmouseout="this.style.color='#1ea53a'">logout</button>
         </form>
       </nav>
     </div>
@@ -48,7 +49,7 @@
         <tr><th>instance</th><th>depth</th><th>capacity</th><th>util</th></tr>
       </thead>
       <tbody id="queues-tbody">
-        <tr><td colspan="4" style="color:#007a1f">loading_</td></tr>
+        <tr><td colspan="4" style="color:#1ea53a">loading_</td></tr>
       </tbody>
     </table>
 
@@ -58,7 +59,7 @@
         <tr><th>finalized</th><th>state</th><th>event</th><th>subscribers</th></tr>
       </thead>
       <tbody id="deliveries-tbody">
-        <tr><td colspan="4" style="color:#007a1f">loading_</td></tr>
+        <tr><td colspan="4" style="color:#1ea53a">loading_</td></tr>
       </tbody>
     </table>
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/scuq/notrouter/internal/logbuffer"
 	"github.com/scuq/notrouter/internal/version"
 )
 
@@ -28,9 +29,6 @@ type Server struct {
 	uiH    *uiHandler
 }
 
-// NewWithUI wires the full admin server. configPath + loadedHash + links
-// are passed through to the UI handler so the config-viewer page can do
-// its drift check and render the configurable nav links.
 func NewWithUI(
 	addr string,
 	basicUser, basicPass string,
@@ -40,9 +38,10 @@ func NewWithUI(
 	log *slog.Logger,
 	configPath, loadedHash string,
 	links map[string]string,
+	logs *logbuffer.Buffer,
 ) (*Server, error) {
 	store := NewSessionStore(sessionTTL)
-	uiH, err := newUIHandler(store, creds, probes, sessionTTL, log, configPath, loadedHash, links)
+	uiH, err := newUIHandler(store, creds, probes, sessionTTL, log, configPath, loadedHash, links, logs)
 	if err != nil {
 		return nil, err
 	}

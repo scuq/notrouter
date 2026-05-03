@@ -54,7 +54,9 @@ func run(configPath string) error {
 		return err
 	}
 
-	log := logging.New(cfg.Logging.Level)
+	// logging.New now also returns the in-memory ring buffer; the admin UI
+	// reads from it via /admin/api/logs.
+	log, logBuf := logging.New(cfg.Logging.Level)
 	log.Info("notrouter starting",
 		"version", version.Version,
 		"commit", version.Commit,
@@ -154,6 +156,7 @@ func run(configPath string) error {
 		cfg.Path(),
 		cfg.LoadedHash(),
 		cfg.Links,
+		logBuf,
 	)
 	if err != nil {
 		cancel()

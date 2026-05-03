@@ -273,3 +273,125 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
   max-height: 60vh;
   overflow-y: auto;
 }
+/* === log viewer === */
+
+.log-controls {
+  display: flex;
+  gap: 1rem;
+  align-items: end;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+.log-controls label.inline {
+  display: flex;
+  flex-direction: column;
+  gap: .25rem;
+  margin: 0;
+}
+.log-controls label.inline.grow { flex: 1; min-width: 250px; }
+.log-controls label.inline > span {
+  font-size: .72rem;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: #1ea53a;
+  text-shadow: 0 0 3px rgba(30, 165, 58, .3);
+}
+.log-controls select,
+.log-controls input[type="text"] {
+  width: 100%;
+  margin: 0;
+  padding: .45rem .6rem;
+  background: #000;
+  color: #00ff41;
+  border: 1px solid #1ea53a;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: .9rem;
+  outline: none;
+}
+.log-controls select:focus,
+.log-controls input:focus {
+  border-color: #00ff41;
+  box-shadow: 0 0 8px rgba(0, 255, 65, .3);
+}
+.log-controls .inline-btn {
+  margin: 0;
+  padding: .45rem 1rem;
+  font-size: .75rem;
+  letter-spacing: 2px;
+}
+
+.log-container {
+  position: relative;
+  background: #000;
+  border: 1px solid #003a0f;
+  height: 65vh;
+  overflow-y: auto;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: .82rem;
+  line-height: 1.45;
+  margin-bottom: 1rem;
+}
+
+.log-list {
+  padding: .5rem 1rem;
+}
+
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-bottom: 1px solid rgba(0, 255, 65, .04);
+  padding: .15rem 0;
+}
+.log-line:last-child { border-bottom: none; }
+
+.log-time {
+  color: #1ea53a;
+  font-variant-numeric: tabular-nums;
+}
+.log-level {
+  display: inline-block;
+  min-width: 3.5em;
+  text-align: left;
+  font-weight: 700;
+  letter-spacing: .5px;
+}
+
+.log-line.lvl-debug .log-level { color: #007a1f; }
+.log-line.lvl-debug .log-msg   { color: #7ac98a; }
+
+.log-line.lvl-info  .log-level { color: #00ff41; text-shadow: 0 0 4px rgba(0, 255, 65, .4); }
+.log-line.lvl-info  .log-msg   { color: #00ff41; }
+
+.log-line.lvl-warn  .log-level { color: #ffaa00; text-shadow: 0 0 4px rgba(255, 170, 0, .4); }
+.log-line.lvl-warn  .log-msg   { color: #ffaa00; }
+
+.log-line.lvl-error .log-level { color: #ff0040; text-shadow: 0 0 5px rgba(255, 0, 64, .5); }
+.log-line.lvl-error .log-msg   { color: #ff5570; }
+
+/* the "N new lines, click to resume" floating banner. position:sticky
+   keeps it pinned to the bottom of the scrollable container even as
+   the user scrolls within it. */
+.resume-banner {
+  position: sticky;
+  bottom: .5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  margin: 0 auto;
+  padding: .4rem 1rem;
+  background: rgba(0, 30, 10, .95);
+  color: #00ff41;
+  border: 1px solid #00ff41;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: .8rem;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  cursor: pointer;
+  text-shadow: 0 0 6px rgba(0, 255, 65, .5);
+  box-shadow: 0 0 12px rgba(0, 255, 65, .3);
+  display: block;
+  width: max-content;
+}
+.resume-banner:hover {
+  background: rgba(0, 60, 20, .95);
+  box-shadow: 0 0 18px rgba(0, 255, 65, .5);
+}

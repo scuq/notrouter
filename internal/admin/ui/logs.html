@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>notrouter // logs</title>
+  <link rel="stylesheet" href="/admin/ui/static/style.css">
+</head>
+<body class="app-page">
+  <div class="terminal">
+    <div class="terminal-header">
+      <h1>notrouter // logs</h1>
+      <nav class="nav">
+        <a href="/admin/ui/">overview</a>
+        <a href="/admin/ui/config">config</a>
+        <a href="/admin/ui/logs" class="active">logs</a>
+        {{ range $k, $v := .Links }}<a href="{{ $v }}" target="_blank" rel="noopener">{{ $k }}</a>{{ end }}
+        <a href="/admin/ui/change-password">change password</a>
+        <form method="POST" action="/admin/api/logout" style="display:inline; margin:0;">
+          <input type="hidden" name="csrf" value="{{ .CSRF }}">
+          <button type="submit" style="all:unset; cursor:pointer; color:#1ea53a; letter-spacing:1.5px; text-transform:uppercase; font-size:.82rem; text-shadow: 0 0 3px rgba(30, 165, 58, .25);" onmouseover="this.style.color='#00ff41'" onmouseout="this.style.color='#1ea53a'">logout</button>
+        </form>
+      </nav>
+    </div>
+
+    <div class="log-controls">
+      <label class="inline">
+        <span>level</span>
+        <select id="log-level">
+          <option value="">all</option>
+          <option value="info" selected>info+</option>
+          <option value="warn">warn+</option>
+          <option value="error">error</option>
+        </select>
+      </label>
+      <label class="inline grow">
+        <span>search</span>
+        <input type="text" id="log-search" placeholder="filter by substring (case-insensitive)">
+      </label>
+      <button type="button" id="log-clear" class="inline-btn">clear view</button>
+    </div>
+
+    <div id="log-container" class="log-container">
+      <div id="log-list" class="log-list"></div>
+      <button type="button" id="log-resume" class="resume-banner" style="display:none;">
+        <span id="log-resume-count">0 new lines</span> &middot; click to resume tail
+      </button>
+    </div>
+
+    <div class="footer">
+      <span>signed in as {{ .User }}</span>
+      <span id="log-status">tailing</span>
+    </div>
+  </div>
+
+  <script src="/admin/ui/static/logs.js"></script>
+</body>
+</html>
