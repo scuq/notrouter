@@ -2,6 +2,7 @@ package admin
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -17,10 +18,33 @@ import (
 	"sync"
 	"time"
 
+	"github.com/scuq/notrouter/internal/admin/creds"
 	"github.com/scuq/notrouter/internal/config"
 	"github.com/scuq/notrouter/internal/logbuffer"
 	"github.com/scuq/notrouter/internal/version"
 )
+
+// authMethodKey records which auth path verified this request, so
+// requireSession can know whether to enforce CSRF (cookie -> yes,
+// bearer -> no).
+type authMethodKey struct{}
+
+const (
+	authMethodCookie = "cookie"
+	authMethodBearer = "bearer"
+	authMethodBasic  = "basic"
+)
+
+func withAuthMethod(ctx context.Context, method string) context.Context {
+	return context.WithValue(ctx, authMethodKey{}, method)
+}
+
+func authMethodFrom(r *http.Request) string {
+	if v, ok := r.Context().Value(authMethodKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
 
 type uiHandler struct {
 	tmplLogin    *template.Template
@@ -29,6 +53,7 @@ type uiHandler struct {
 	tmplConfig   *template.Template
 	tmplLogs     *template.Template
 	tmplTest     *template.Template
+	tmplTokens   *template.Template
 	staticFS     http.FileSystem
 	store        *SessionStore
 	creds        credsAccessor
@@ -39,10 +64,7 @@ type uiHandler struct {
 	rtMu sync.RWMutex
 	rt   reloaderAccessor
 
-	credsPath string
-
-	// httpClient is reused for the test-event loopback. Single client
-	// across requests gives us connection reuse to the local webhook.
+	credsPath  string
 	httpClient *http.Client
 }
 
@@ -61,11 +83,19 @@ type ReloadResult struct {
 	LKGHash         string `json:"lkg_hash,omitempty"`
 }
 
+// credsAccessor extends with token-related operations introduced in
+// v0.2.2. The Store satisfies this; tests can mock.
 type credsAccessor interface {
 	Verify(plain string) bool
 	MustChange() bool
 	UpdatedAt() time.Time
 	SetPassword(newPlain string) error
+	VerifyToken(plain string) (string, error)
+	MintToken(user, label string) (*creds.MintResult, error)
+	ListTokens(user string) []creds.TokenView
+	RefreshTokenByHash(hash, requestingUser string) (*creds.TokenView, error)
+	RefreshTokenSelf(plain string) (*creds.TokenView, error)
+	RevokeTokenByHash(hash, requestingUser string) error
 }
 
 func newUIHandler(
@@ -101,6 +131,10 @@ func newUIHandler(
 	if err != nil {
 		return nil, err
 	}
+	tokensTpl, err := template.ParseFS(uiFS, "ui/tokens.html")
+	if err != nil {
+		return nil, err
+	}
 	staticSub, err := fs.Sub(uiFS, "ui/static")
 	if err != nil {
 		return nil, err
@@ -112,6 +146,7 @@ func newUIHandler(
 		tmplConfig:   configTpl,
 		tmplLogs:     logsTpl,
 		tmplTest:     testTpl,
+		tmplTokens:   tokensTpl,
 		staticFS:     http.FS(staticSub),
 		store:        store,
 		creds:        creds,
@@ -120,71 +155,113 @@ func newUIHandler(
 		rt:           rt,
 		credsPath:    credsPath,
 		logs:         logs,
-		// 10s timeout is plenty - the webhook receiver returns 202 within
-		// microseconds. If something is wrong we want to know fast, not
-		// hang the UI.
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		httpClient:   &http.Client{Timeout: 10 * time.Second},
 	}, nil
 }
 
 func (h *uiHandler) register(mux *http.ServeMux) {
 	mux.Handle("/admin/ui/static/", http.StripPrefix("/admin/ui/static/", http.FileServer(h.staticFS)))
 	mux.HandleFunc("/admin/ui/login", h.handleLoginPage)
-	mux.HandleFunc("/admin/ui/change-password", h.requireSession(h.handleChangePasswordPage))
-	mux.HandleFunc("/admin/ui/config", h.requireSession(h.handleConfigPage))
-	mux.HandleFunc("/admin/ui/logs", h.requireSession(h.handleLogsPage))
-	mux.HandleFunc("/admin/ui/test", h.requireSession(h.handleTestPage))
-	mux.HandleFunc("/admin/ui/", h.requireSession(h.handleDashboard))
+	mux.HandleFunc("/admin/ui/change-password", h.requireAuth(h.handleChangePasswordPage))
+	mux.HandleFunc("/admin/ui/config", h.requireAuth(h.handleConfigPage))
+	mux.HandleFunc("/admin/ui/logs", h.requireAuth(h.handleLogsPage))
+	mux.HandleFunc("/admin/ui/test", h.requireAuth(h.handleTestPage))
+	mux.HandleFunc("/admin/ui/tokens", h.requireAuth(h.handleTokensPage))
+	mux.HandleFunc("/admin/ui/", h.requireAuth(h.handleDashboard))
 	mux.HandleFunc("/admin/ui", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin/ui/", http.StatusFound)
 	})
 
 	mux.HandleFunc("/admin/api/login", h.handleLoginPost)
 	mux.HandleFunc("/admin/api/logout", h.handleLogout)
-	mux.HandleFunc("/admin/api/change-password", h.requireSession(h.handleChangePasswordPost))
-	mux.HandleFunc("/admin/api/state", h.requireSession(h.handleAPIState))
-	mux.HandleFunc("/admin/api/deliveries", h.requireSession(h.handleAPIDeliveries))
-	mux.HandleFunc("/admin/api/config", h.requireSession(h.handleAPIConfig))
-	mux.HandleFunc("/admin/api/logs", h.requireSession(h.handleAPILogs))
+	mux.HandleFunc("/admin/api/change-password", h.requireAuth(h.handleChangePasswordPost))
+	mux.HandleFunc("/admin/api/state", h.requireAuth(h.handleAPIState))
+	mux.HandleFunc("/admin/api/deliveries", h.requireAuth(h.handleAPIDeliveries))
+	mux.HandleFunc("/admin/api/config", h.requireAuth(h.handleAPIConfig))
+	mux.HandleFunc("/admin/api/logs", h.requireAuth(h.handleAPILogs))
 
-	mux.HandleFunc("/admin/api/config/validate", h.requireSession(h.handleAPIConfigValidate))
-	mux.HandleFunc("/admin/api/config/save", h.requireSession(h.handleAPIConfigSave))
-	mux.HandleFunc("/admin/api/config/reload", h.requireSession(h.handleAPIConfigReload))
+	mux.HandleFunc("/admin/api/config/validate", h.requireAuth(h.handleAPIConfigValidate))
+	mux.HandleFunc("/admin/api/config/save", h.requireAuth(h.handleAPIConfigSave))
+	mux.HandleFunc("/admin/api/config/reload", h.requireAuth(h.handleAPIConfigReload))
 
-	mux.HandleFunc("/admin/api/test/send", h.requireSession(h.handleAPITestSend))
+	mux.HandleFunc("/admin/api/test/send", h.requireAuth(h.handleAPITestSend))
+
+	// Token endpoints. Every state-changing one (mint/refresh/revoke)
+	// uses requireCSRFIfCookie so cookie-authed UI flows enforce CSRF
+	// while bearer-authed scripts skip it.
+	mux.HandleFunc("/admin/api/tokens", h.requireAuth(h.handleAPITokensList))
+	mux.HandleFunc("/admin/api/tokens/mint", h.requireAuth(h.handleAPITokensMint))
+	mux.HandleFunc("/admin/api/tokens/refresh", h.requireAuth(h.handleAPITokensRefresh))
+	mux.HandleFunc("/admin/api/tokens/refresh-self", h.requireAuth(h.handleAPITokensRefreshSelf))
+	mux.HandleFunc("/admin/api/tokens/revoke", h.requireAuth(h.handleAPITokensRevoke))
 }
 
-func (h *uiHandler) requireSession(next http.HandlerFunc) http.HandlerFunc {
+// requireAuth is the new gating middleware. It accepts:
+//   - Session cookie (cookie auth method, CSRF required for state changes)
+//   - Bearer token (bearer auth method, no CSRF needed)
+//   - HTTP basic auth (basic auth method, no CSRF needed)
+//
+// If none match, redirects to /admin/ui/login (UI paths) or 401 JSON
+// (API paths). The "must change password" redirect still applies to
+// cookie-authed sessions only; bearer scripts don't get caught in
+// the human-only password rotation flow.
+func (h *uiHandler) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		sid := readSessionCookie(r)
-		user, _, ok := h.store.Get(sid)
-		if !ok {
-			if strings.HasPrefix(r.URL.Path, "/admin/api/") {
-				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		// 1) Session cookie
+		if sid := readSessionCookie(r); sid != "" {
+			if user, _, ok := h.store.Get(sid); ok {
+				ctx := withAuthMethod(r.Context(), authMethodCookie)
+				ctx = withUser(ctx, user)
+				if h.creds.MustChange() &&
+					r.URL.Path != "/admin/ui/change-password" &&
+					r.URL.Path != "/admin/api/change-password" &&
+					r.URL.Path != "/admin/api/logout" {
+					http.Redirect(w, r, "/admin/ui/change-password", http.StatusFound)
+					return
+				}
+				r.Header.Set("X-Notrouter-User", user)
+				next(w, r.WithContext(ctx))
 				return
 			}
-			http.Redirect(w, r, "/admin/ui/login", http.StatusFound)
+		}
+
+		// 2) Bearer token
+		hdr := r.Header.Get("Authorization")
+		if strings.HasPrefix(hdr, "Bearer ") {
+			token := strings.TrimPrefix(hdr, "Bearer ")
+			if user, err := h.creds.VerifyToken(token); err == nil {
+				ctx := withAuthMethod(r.Context(), authMethodBearer)
+				ctx = withUser(ctx, user)
+				r.Header.Set("X-Notrouter-User", user)
+				next(w, r.WithContext(ctx))
+				return
+			}
+			// Fall through to 401 below; auth failed.
+		}
+
+		// Unauthorized.
+		if strings.HasPrefix(r.URL.Path, "/admin/api/") {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
-		if h.creds.MustChange() &&
-			r.URL.Path != "/admin/ui/change-password" &&
-			r.URL.Path != "/admin/api/change-password" &&
-			r.URL.Path != "/admin/api/logout" {
-			http.Redirect(w, r, "/admin/ui/change-password", http.StatusFound)
-			return
-		}
-		r.Header.Set("X-Notrouter-User", user)
-		next(w, r)
+		http.Redirect(w, r, "/admin/ui/login", http.StatusFound)
 	}
 }
 
+// requireCSRFIfCookie returns nil (allow) when the request was bearer-
+// authed, or runs the appropriate CSRF check when cookie-authed. We
+// have two CSRF check styles (form-encoded vs header) - caller picks.
+func (h *uiHandler) requireCSRFIfCookie(r *http.Request, fromHeader bool) error {
+	if authMethodFrom(r) == authMethodBearer {
+		return nil // Bearer-authed: CSRF not applicable
+	}
+	if fromHeader {
+		return h.checkCSRFHeader(r)
+	}
+	return h.checkCSRF(r)
+}
+
 func (h *uiHandler) writeCSRFCookie(w http.ResponseWriter, r *http.Request, value string) {
-	// CSRF cookie is intentionally readable from JavaScript (no HttpOnly).
-	// The double-submit-cookie pattern relies on the JS being able to read
-	// the cookie and put it in a request header; the security comes from
-	// the same-origin policy preventing other origins from reading it.
-	// The session cookie still uses HttpOnly - that's the one whose
-	// secrecy matters.
 	http.SetCookie(w, &http.Cookie{
 		Name:     csrfCookieName,
 		Value:    value,
@@ -325,7 +402,21 @@ func (h *uiHandler) handleTestPage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --- API: login ---
+func (h *uiHandler) handleTokensPage(w http.ResponseWriter, r *http.Request) {
+	user := r.Header.Get("X-Notrouter-User")
+	_, csrf, _ := h.store.Get(readSessionCookie(r))
+	h.writeCSRFCookie(w, r, csrf)
+	h.renderTemplate(w, h.tmplTokens, map[string]interface{}{
+		"User":          user,
+		"CSRF":          csrf,
+		"Version":       version.Version,
+		"Commit":        version.Commit,
+		"Links":         h.currentCfg().Links,
+		"TokenLifetime": creds.TokenLifetime.String(),
+	})
+}
+
+// --- API: login / logout / change-password (form flows, CSRF always) ---
 
 func (h *uiHandler) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -381,14 +472,12 @@ func (h *uiHandler) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/ui/login", http.StatusFound)
 }
 
-// --- API: change password ---
-
 func (h *uiHandler) handleChangePasswordPost(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
-	if err := h.checkCSRF(r); err != nil {
+	if err := h.requireCSRFIfCookie(r, false); err != nil {
 		http.Redirect(w, r, "/admin/ui/change-password?err=invalid+csrf", http.StatusFound)
 		return
 	}
@@ -421,7 +510,7 @@ func (h *uiHandler) handleChangePasswordPost(w http.ResponseWriter, r *http.Requ
 	http.Redirect(w, r, "/admin/ui/change-password?ok=password+updated", http.StatusFound)
 }
 
-// --- API: state, deliveries, config (GET), logs ---
+// --- API: read-only state, deliveries, config (GET), logs ---
 
 func (h *uiHandler) handleAPIState(w http.ResponseWriter, r *http.Request) {
 	probes := h.currentProbes()
@@ -493,7 +582,7 @@ func (h *uiHandler) handleAPILogs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --- API: editor (validate / save / reload) ---
+// --- API: editor (validate / save / reload) - smart CSRF ---
 
 type editRequest struct {
 	Body             string `json:"body"`
@@ -505,7 +594,7 @@ func (h *uiHandler) handleAPIConfigValidate(w http.ResponseWriter, r *http.Reque
 		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
 		return
 	}
-	if err := h.checkCSRFHeader(r); err != nil {
+	if err := h.requireCSRFIfCookie(r, true); err != nil {
 		writeJSON(w, http.StatusForbidden, map[string]interface{}{"error": "invalid csrf"})
 		return
 	}
@@ -529,7 +618,7 @@ func (h *uiHandler) handleAPIConfigSave(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
 		return
 	}
-	if err := h.checkCSRFHeader(r); err != nil {
+	if err := h.requireCSRFIfCookie(r, true); err != nil {
 		writeJSON(w, http.StatusForbidden, map[string]interface{}{"error": "invalid csrf"})
 		return
 	}
@@ -572,7 +661,7 @@ func (h *uiHandler) handleAPIConfigReload(w http.ResponseWriter, r *http.Request
 		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
 		return
 	}
-	if err := h.checkCSRFHeader(r); err != nil {
+	if err := h.requireCSRFIfCookie(r, true); err != nil {
 		writeJSON(w, http.StatusForbidden, map[string]interface{}{"error": "invalid csrf"})
 		return
 	}
@@ -618,20 +707,12 @@ type testSendRequest struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
-// handleAPITestSend POSTs the operator-provided payload to the local
-// webhook receiver. We don't bypass the receiver - the point is to fire
-// a real event through the entire pipeline so its behavior matches what
-// production traffic would look like.
-//
-// Resolves the webhook listen address ("127.0.0.1:<port>" if listen is
-// ":<port>", otherwise as configured) and reuses the ui handler's
-// httpClient for connection pooling on rapid-fire testing.
 func (h *uiHandler) handleAPITestSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
 		return
 	}
-	if err := h.checkCSRFHeader(r); err != nil {
+	if err := h.requireCSRFIfCookie(r, true); err != nil {
 		writeJSON(w, http.StatusForbidden, map[string]interface{}{"error": "invalid csrf"})
 		return
 	}
@@ -684,17 +765,187 @@ func (h *uiHandler) handleAPITestSend(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// loopbackURL constructs an http://127.0.0.1:<port> URL for the webhook
-// receiver. Receiver listens on the address from cfg.Listen.Webhook, but
-// that's typically ":8080" - we rewrite host to localhost for the loop.
+// --- API: tokens (mint / list / refresh / refresh-self / revoke) ---
+
+type mintRequest struct {
+	Label string `json:"label"`
+}
+
+type tokenHashRequest struct {
+	Hash string `json:"hash"`
+}
+
+// handleAPITokensList returns the user's tokens. For v0.2.2 only "admin"
+// exists, so this is effectively all tokens.
+func (h *uiHandler) handleAPITokensList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"GET required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	user := r.Header.Get("X-Notrouter-User")
+	// Local admin scope sees all tokens; this generalizes cleanly when
+	// OIDC users land in v0.3 (they'll be scoped to user==their name).
+	scope := ""
+	if user != "admin" {
+		scope = user
+	}
+	tokens := h.creds.ListTokens(scope)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"tokens": tokens,
+		"count":  len(tokens),
+	})
+}
+
+func (h *uiHandler) handleAPITokensMint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.requireCSRFIfCookie(r, true); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{"error": "invalid csrf"})
+		return
+	}
+	req := &mintRequest{}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": "bad request body: " + err.Error()})
+		return
+	}
+
+	user := r.Header.Get("X-Notrouter-User")
+	res, err := h.creds.MintToken(user, req.Label)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, creds.ErrInvalidLabel) {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	h.log.Info("token minted",
+		"user", user,
+		"label", req.Label,
+		"hash", res.View.Hash,
+		"expires_at", res.View.ExpiresAt)
+	// Return the plaintext token. UI shows it ONCE.
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"token": res.Token,
+		"view":  res.View,
+	})
+}
+
+func (h *uiHandler) handleAPITokensRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.requireCSRFIfCookie(r, true); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{"error": "invalid csrf"})
+		return
+	}
+	req := &tokenHashRequest{}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	user := r.Header.Get("X-Notrouter-User")
+	scope := ""
+	if user != "admin" {
+		scope = user
+	}
+	view, err := h.creds.RefreshTokenByHash(req.Hash, scope)
+	if err != nil {
+		status := tokenErrStatus(err)
+		writeJSON(w, status, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	h.log.Info("token refreshed",
+		"user", user,
+		"hash", req.Hash,
+		"new_expires_at", view.ExpiresAt)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"view": view})
+}
+
+// handleAPITokensRefreshSelf is the script path. Caller authenticates
+// with the token itself; we extract it from the Bearer header (NOT the
+// body, to avoid encouraging it being logged). Doesn't require CSRF
+// because the token presence IS the authentication.
 //
-// IPv6 listeners ("[::]:8080") get the same treatment - we always use
-// 127.0.0.1 because the webhook receiver also listens there by virtue
-// of binding the wildcard.
+// This means a script with a soon-expiring token can refresh itself:
+//
+//	curl -X POST -H "Authorization: Bearer notr_..." \
+//	     http://notrouter:9090/admin/api/tokens/refresh-self
+func (h *uiHandler) handleAPITokensRefreshSelf(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	hdr := r.Header.Get("Authorization")
+	if !strings.HasPrefix(hdr, "Bearer ") {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"error": "refresh-self requires the token in the Authorization: Bearer header",
+		})
+		return
+	}
+	token := strings.TrimPrefix(hdr, "Bearer ")
+	view, err := h.creds.RefreshTokenSelf(token)
+	if err != nil {
+		writeJSON(w, tokenErrStatus(err), map[string]interface{}{"error": err.Error()})
+		return
+	}
+	h.log.Info("token self-refreshed",
+		"hash", view.Hash,
+		"user", view.User,
+		"new_expires_at", view.ExpiresAt)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"view": view})
+}
+
+func (h *uiHandler) handleAPITokensRevoke(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.requireCSRFIfCookie(r, true); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{"error": "invalid csrf"})
+		return
+	}
+	req := &tokenHashRequest{}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	user := r.Header.Get("X-Notrouter-User")
+	scope := ""
+	if user != "admin" {
+		scope = user
+	}
+	if err := h.creds.RevokeTokenByHash(req.Hash, scope); err != nil {
+		writeJSON(w, tokenErrStatus(err), map[string]interface{}{"error": err.Error()})
+		return
+	}
+	h.log.Warn("token revoked", "user", user, "hash", req.Hash)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
+}
+
+// tokenErrStatus maps creds.Err* sentinels to HTTP statuses.
+func tokenErrStatus(err error) int {
+	switch {
+	case errors.Is(err, creds.ErrTokenNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, creds.ErrTokenExpired):
+		return http.StatusGone // 410: existed but is gone
+	case errors.Is(err, creds.ErrTokenForbidden):
+		return http.StatusForbidden
+	case errors.Is(err, creds.ErrInvalidLabel),
+		errors.Is(err, creds.ErrInvalidToken):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
 func loopbackURL(listen string) string {
 	host, port, err := net.SplitHostPort(listen)
 	if err != nil {
-		// listen is malformed; fall back to using it as-is.
 		return "http://" + listen
 	}
 	if host == "" || host == "0.0.0.0" || host == "::" {

@@ -54,9 +54,6 @@ func run(configPath string) error {
 		"loaded_hash", cfg.LoadedHash(),
 		"plugins", plugins.Types())
 
-	// Loud, unmissable warning if the operator still has the deprecated
-	// password field set in their YAML. The value is ignored; the source
-	// of truth for both basic auth and the web UI is creds.json.
 	if cfg.DeprecatedPasswordSet() {
 		log.Warn("auth.admin.password in config.yaml is DEPRECATED and IGNORED",
 			"action", "remove this key from your YAML",
@@ -76,6 +73,16 @@ func run(configPath string) error {
 			"updated_at", credStore.UpdatedAt(),
 			"schema_version", credStore.SchemaVersion())
 	}
+
+	// Background expired-token sweeper. Runs hourly, logs only when it
+	// actually removes something so the log isn't noisy. The returned
+	// stop fn is invoked at shutdown to halt the goroutine cleanly.
+	stopSweeper := credStore.StartTokenSweeper(func(removed int) {
+		if removed > 0 {
+			log.Info("expired tokens swept", "count", removed)
+		}
+	})
+	defer stopSweeper()
 
 	parentCtx, cancelParent := context.WithCancel(context.Background())
 	defer cancelParent()

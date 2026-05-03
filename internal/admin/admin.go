@@ -4,18 +4,35 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/scuq/notrouter/internal/admin/creds"
 	"github.com/scuq/notrouter/internal/logbuffer"
 	"github.com/scuq/notrouter/internal/version"
 )
 
 const QueueDegradedRatio = 0.9
+
+// authCtxKey is used to stash the authenticated username on the request
+// context. Handlers downstream of auth() pull it out via authedUser(r).
+type authCtxKey struct{}
+
+// authedUser returns the username established by the auth middleware
+// for this request. Empty string if not set (which means a handler is
+// reachable without going through auth - bug).
+func authedUser(r *http.Request) string {
+	if v, ok := r.Context().Value(authCtxKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
 
 type Server struct {
 	addr   string
@@ -30,10 +47,6 @@ type Server struct {
 	rt   reloaderAccessor
 }
 
-// NewWithUI wires the admin server. Basic auth on legacy endpoints uses
-// the username from config.yaml (which defaults to "admin") and the
-// bcrypt-hashed password from creds.json (Verify()). No plaintext
-// password is passed in - the password lives only in creds.json.
 func NewWithUI(
 	addr string,
 	basicUser string,
@@ -74,13 +87,13 @@ func (s *Server) Start(ctx context.Context, wg *sync.WaitGroup) error {
 
 	s.uiH.register(mux)
 
-	dual := s.dualAuth(http.HandlerFunc(s.handleLegacyMux))
-	mux.Handle("/admin/state", dual)
-	mux.Handle("/admin/deliveries", dual)
-	mux.Handle("/admin/dedup/clear", dual)
-	mux.Handle("/admin/", dual)
+	authed := s.auth(http.HandlerFunc(s.handleLegacyMux))
+	mux.Handle("/admin/state", authed)
+	mux.Handle("/admin/deliveries", authed)
+	mux.Handle("/admin/dedup/clear", authed)
+	mux.Handle("/admin/", authed)
 
-	mux.Handle("/", s.dualAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/", s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("notrouter admin\n"))
 	})))
 
@@ -117,30 +130,75 @@ func (s *Server) currentProbes() Probes {
 	return s.rt.Probes()
 }
 
-// dualAuth accepts either a valid session cookie or HTTP basic auth.
-// Basic auth: username compared in constant time, password verified
-// against the bcrypt hash in creds.json. Each basic auth request thus
-// pays ~10ms of bcrypt cost - acceptable for the small volume of admin
-// API calls. If you hammer it with monitoring scripts, mint an API
-// token instead (planned v0.2.2) - that path skips bcrypt.
-func (s *Server) dualAuth(next http.Handler) http.Handler {
+// auth is the unified auth middleware. Order of preference:
+//  1. Session cookie (UI users; cheap, ~microseconds)
+//  2. Bearer token (scripts; sha256+map lookup, ~microseconds)
+//  3. HTTP basic auth (legacy curl; bcrypt verify, ~10ms)
+//
+// On success, the username is attached to the request context so
+// handlers can record who did what.
+func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 1) Session cookie
 		if sid := readSessionCookie(r); sid != "" {
-			if _, _, ok := s.store.Get(sid); ok {
-				next.ServeHTTP(w, r)
+			if user, _, ok := s.store.Get(sid); ok {
+				next.ServeHTTP(w, r.WithContext(withUser(r.Context(), user)))
 				return
 			}
 		}
+
+		// 2) Bearer token
+		if user, ok := s.tryBearer(r); ok {
+			next.ServeHTTP(w, r.WithContext(withUser(r.Context(), user)))
+			return
+		}
+
+		// 3) Basic auth
 		u, p, ok := r.BasicAuth()
 		if ok &&
 			subtle.ConstantTimeCompare([]byte(u), []byte(s.user)) == 1 &&
 			s.creds.Verify(p) {
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(w, r.WithContext(withUser(r.Context(), u)))
 			return
 		}
+
 		w.Header().Set("WWW-Authenticate", `Basic realm="notrouter"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	})
+}
+
+func withUser(ctx context.Context, user string) context.Context {
+	return context.WithValue(ctx, authCtxKey{}, user)
+}
+
+// tryBearer pulls "Authorization: Bearer <token>" out of the request
+// and asks the creds store to verify. Returns the owning username on
+// success. Distinguishes "no header" (return false silently) from
+// "bad token" (also false but logged for ops visibility).
+func (s *Server) tryBearer(r *http.Request) (string, bool) {
+	hdr := r.Header.Get("Authorization")
+	if hdr == "" || !strings.HasPrefix(hdr, "Bearer ") {
+		return "", false
+	}
+	token := strings.TrimPrefix(hdr, "Bearer ")
+	user, err := s.creds.VerifyToken(token)
+	if err != nil {
+		// Quiet on bad-token; tokens turn over and we don't want to
+		// flood logs with failed scripts. Operator can grep for this
+		// at debug level.
+		switch {
+		case errors.Is(err, creds.ErrTokenExpired):
+			s.log.Debug("bearer token expired", "remote", r.RemoteAddr)
+		case errors.Is(err, creds.ErrTokenNotFound):
+			s.log.Debug("bearer token not found", "remote", r.RemoteAddr)
+		case errors.Is(err, creds.ErrInvalidToken):
+			s.log.Debug("bearer token malformed", "remote", r.RemoteAddr)
+		default:
+			s.log.Warn("bearer verify error", "err", err)
+		}
+		return "", false
+	}
+	return user, true
 }
 
 func (s *Server) handleLegacyMux(w http.ResponseWriter, r *http.Request) {
@@ -257,7 +315,9 @@ func (s *Server) handleDedupClear(w http.ResponseWriter, r *http.Request) {
 	}
 	before := probes.Dedup.Size()
 	probes.Dedup.Clear()
-	s.log.Warn("dedup cleared via admin endpoint", "previous_size", before)
+	s.log.Warn("dedup cleared via admin endpoint",
+		"previous_size", before,
+		"user", authedUser(r))
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"cleared":       true,
 		"previous_size": before,

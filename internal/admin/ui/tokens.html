@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>notrouter // tokens</title>
+  <link rel="stylesheet" href="/admin/ui/static/style.css">
+</head>
+<body class="app-page">
+  <div class="terminal">
+    <div class="terminal-header">
+      <h1>notrouter // api tokens</h1>
+      <nav class="nav">
+        <a href="/admin/ui/">overview</a>
+        <a href="/admin/ui/config">config</a>
+        <a href="/admin/ui/logs">logs</a>
+        <a href="/admin/ui/test">test</a>
+        <a href="/admin/ui/tokens" class="active">tokens</a>
+        {{ range $k, $v := .Links }}<a href="{{ $v }}" target="_blank" rel="noopener">{{ $k }}</a>{{ end }}
+        <a href="/admin/ui/change-password">change password</a>
+        <form method="POST" action="/admin/api/logout" style="display:inline; margin:0;">
+          <input type="hidden" name="csrf" value="{{ .CSRF }}">
+          <button type="submit" style="all:unset; cursor:pointer; color:#1ea53a; letter-spacing:1.5px; text-transform:uppercase; font-size:.82rem; text-shadow: 0 0 3px rgba(30, 165, 58, .25);" onmouseover="this.style.color='#00ff41'" onmouseout="this.style.color='#1ea53a'">logout</button>
+        </form>
+      </nav>
+    </div>
+
+    <div class="cfg-help">
+      <p>
+        api tokens authenticate scripts and external tools against the notrouter
+        admin api. include the token as <code>authorization: bearer notr_...</code>
+        on every request. tokens are valid for {{ .TokenLifetime }} from creation
+        or last refresh.
+      </p>
+      <p>
+        <strong>refresh:</strong> click the [refresh] button while the token is
+        still valid to extend by another {{ .TokenLifetime }}. expired tokens
+        cannot be refreshed - mint a new one.
+      </p>
+      <p>
+        <strong>script self-refresh:</strong>
+        <code>curl -X POST -H "Authorization: Bearer $TOKEN" http://notrouter:9090/admin/api/tokens/refresh-self</code>
+      </p>
+    </div>
+
+    <h2>create new token</h2>
+    <div class="test-form">
+      <label class="inline grow">
+        <span>label (3-50 chars, required)</span>
+        <input type="text" id="tok-label" placeholder="ansible-prod, monitoring-script, ..." maxlength="50">
+      </label>
+      <button type="button" id="tok-mint" class="inline-btn">create</button>
+    </div>
+
+    <div id="tok-status" class="cfg-status"></div>
+
+    <div id="tok-fresh" class="tok-fresh" style="display:none;">
+      <div class="tok-fresh-header">
+        ⚠ NEW TOKEN - copy now, this is the only time it will be shown
+      </div>
+      <div class="tok-fresh-value">
+        <code id="tok-fresh-code"></code>
+      </div>
+      <div class="tok-fresh-actions">
+        <button type="button" id="tok-copy" class="inline-btn">copy to clipboard</button>
+        <button type="button" id="tok-dismiss" class="inline-btn">i saved it, dismiss</button>
+      </div>
+    </div>
+
+    <h2>existing tokens</h2>
+    <table id="tok-table">
+      <thead>
+        <tr>
+          <th>label</th>
+          <th>created</th>
+          <th>expires</th>
+          <th>last used</th>
+          <th>actions</th>
+        </tr>
+      </thead>
+      <tbody id="tok-tbody">
+        <tr><td colspan="5" style="color:#1ea53a">loading_</td></tr>
+      </tbody>
+    </table>
+
+    <div class="footer">
+      <span>signed in as {{ .User }}</span>
+      <span>tokens live in <code>{{ "/var/lib/notrouter/creds.json" }}</code></span>
+    </div>
+  </div>
+
+  <script src="/admin/ui/static/tokens.js"></script>
+</body>
+</html>
