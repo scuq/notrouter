@@ -5,9 +5,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"time"
-
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -31,16 +30,23 @@ type Config struct {
 	// don't accidentally appear in re-marshaled output.
 	path       string `yaml:"-"`
 	loadedHash string `yaml:"-"`
+
+	// deprecatedPassword captures any value found in auth.admin.password
+	// at parse time. We don't use it for auth anymore (creds.json owns
+	// the password since v0.2.1) - we just want to warn the operator
+	// at startup if it's still set in their YAML.
+	deprecatedPassword string `yaml:"-"`
 }
 
-// Path returns the file the config was loaded from. Used by the admin UI
-// to re-read the file fresh from disk (the planned hot-reload path).
-func (c *Config) Path() string { return c.path }
-
-// LoadedHash is a short fingerprint of the bytes that were loaded. The
-// admin UI compares this to a fresh hash of the disk file to flag drift
-// between what's running and what's on disk.
+func (c *Config) Path() string       { return c.path }
 func (c *Config) LoadedHash() string { return c.loadedHash }
+
+// DeprecatedPasswordSet reports whether auth.admin.password was present
+// (non-empty) in the loaded YAML. Used by main() to log a one-shot
+// migration warning at startup.
+func (c *Config) DeprecatedPasswordSet() bool {
+	return c.deprecatedPassword != ""
+}
 
 type ListenConfig struct {
 	Webhook   string `yaml:"webhook"`
@@ -54,8 +60,18 @@ type AuthConfig struct {
 }
 
 type AdminAuth struct {
-	Username   string        `yaml:"username"`
-	Password   string        `yaml:"password"`
+	// Username is still used as the literal string compared in basic auth.
+	// Defaults to "admin" if unset. Kept in YAML because it's not a secret.
+	Username string `yaml:"username"`
+
+	// Password is DEPRECATED as of v0.2.1. The web UI password lives in
+	// creds.json (managed via /admin/ui/change-password). Basic auth on
+	// /admin/state etc. now uses the same creds.json bcrypt hash.
+	//
+	// If this field is set in YAML it is ignored at runtime; main()
+	// logs a warning so the operator knows to remove it.
+	Password string `yaml:"password,omitempty"`
+
 	CredsPath  string        `yaml:"creds_path"`
 	SessionTTL time.Duration `yaml:"session_ttl"`
 }
@@ -172,6 +188,12 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	// Capture-and-clear the deprecated password BEFORE applyDefaults,
+	// so applyDefaults can't accidentally set it to "admin" via the
+	// previous behavior.
+	cfg.deprecatedPassword = cfg.Auth.Admin.Password
+	cfg.Auth.Admin.Password = ""
+
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
@@ -182,16 +204,11 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// hashBytes returns the first 8 bytes of SHA256 hex-encoded. Plenty for
-// drift detection; full hashes are wasteful in HTTP responses.
 func hashBytes(b []byte) string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:8])
 }
 
-// HashFile is a public helper the admin handler uses to fingerprint
-// what's on disk right now, so it can compare to LoadedHash() without
-// opening the config package's internals.
 func HashFile(path string) (string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -216,9 +233,7 @@ func (c *Config) applyDefaults() {
 	if c.Auth.Admin.Username == "" {
 		c.Auth.Admin.Username = "admin"
 	}
-	if c.Auth.Admin.Password == "" {
-		c.Auth.Admin.Password = "admin"
-	}
+	// NOTE: no more c.Auth.Admin.Password default. Auth lives in creds.json.
 	if c.Auth.Admin.CredsPath == "" {
 		c.Auth.Admin.CredsPath = "/var/lib/notrouter/creds.json"
 	}
@@ -292,13 +307,7 @@ func (c *Config) validate() error {
 
 // filterLinks drops entries whose values are empty, whitespace-only, or
 // one of the string sentinels ("false", "none", "off", "no") - case-
-// insensitive. The point is to let operators hide a link from the nav
-// without deleting the YAML key, e.g. when a config-management tool
-// owns the structure but the operator wants to disable an entry.
-//
-// Bare YAML false would also be nice, but the Links field is
-// map[string]string so unquoted booleans error at parse time. Quoting
-// the value covers the use case.
+// insensitive.
 func filterLinks(in map[string]string) map[string]string {
 	if len(in) == 0 {
 		return nil
@@ -317,4 +326,3 @@ func filterLinks(in map[string]string) map[string]string {
 	}
 	return out
 }
-

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>notrouter // test</title>
+  <link rel="stylesheet" href="/admin/ui/static/style.css">
+</head>
+<body class="app-page">
+  <div class="terminal">
+    <div class="terminal-header">
+      <h1>notrouter // test event</h1>
+      <nav class="nav">
+        <a href="/admin/ui/">overview</a>
+        <a href="/admin/ui/config">config</a>
+        <a href="/admin/ui/logs">logs</a>
+        <a href="/admin/ui/test" class="active">test</a>
+        {{ range $k, $v := .Links }}<a href="{{ $v }}" target="_blank" rel="noopener">{{ $k }}</a>{{ end }}
+        <a href="/admin/ui/change-password">change password</a>
+        <form method="POST" action="/admin/api/logout" style="display:inline; margin:0;">
+          <input type="hidden" name="csrf" value="{{ .CSRF }}">
+          <button type="submit" style="all:unset; cursor:pointer; color:#1ea53a; letter-spacing:1.5px; text-transform:uppercase; font-size:.82rem; text-shadow: 0 0 3px rgba(30, 165, 58, .25);" onmouseover="this.style.color='#00ff41'" onmouseout="this.style.color='#1ea53a'">logout</button>
+        </form>
+      </nav>
+    </div>
+
+    <div class="notice">
+      this fires a real event through the live pipeline. it WILL be delivered
+      to subscribers (webex, file, etc.). use a recognizable entity name
+      (e.g. <code>test-from-ui-1</code>) so it's distinguishable in audit logs.
+    </div>
+
+    <h2>configuration</h2>
+    <div class="test-form">
+      <label class="inline">
+        <span>profile / endpoint</span>
+        <select id="test-profile">
+          {{ range .Endpoints }}<option value="{{ .Path }}" data-profile="{{ .Profile }}">{{ .Path }} ({{ .Profile }})</option>{{ end }}
+        </select>
+      </label>
+
+      <label class="inline">
+        <span>preset</span>
+        <select id="test-preset">
+          <option value="custom">custom (edit below)</option>
+          <option value="generic">generic - host DOWN</option>
+          <option value="nagios-host-down">nagios - host DOWN</option>
+          <option value="nagios-host-up">nagios - host UP (recovery)</option>
+          <option value="nagios-svc-warn">nagios - service WARNING</option>
+          <option value="nagios-svc-crit">nagios - service CRITICAL</option>
+        </select>
+      </label>
+    </div>
+
+    <h2>payload (json)</h2>
+    <textarea id="test-body" class="cfg-textarea" spellcheck="false" rows="14">{
+  "entity": "test-from-ui-1",
+  "state": "DOWN"
+}</textarea>
+
+    <div class="cfg-toolbar">
+      <button type="button" id="test-send" class="inline-btn">send</button>
+      <button type="button" id="test-clear" class="inline-btn">clear result</button>
+      <a href="/admin/ui/logs" class="inline-btn" target="_blank">open logs</a>
+      <a href="/admin/ui/" class="inline-btn">open overview</a>
+    </div>
+
+    <div id="test-status" class="cfg-status"></div>
+
+    <h2>response</h2>
+    <pre id="test-result" class="code">no request sent yet</pre>
+
+    <div class="cfg-help">
+      <p>
+        <strong>what happens:</strong> notrouter loops back via HTTP to its own
+        webhook receiver at <code>{{ .WebhookAddr }}</code>. the event flows
+        through the entire pipeline (resolve, normalize, dedup, suppress,
+        route, dispatch). you'll see it appear on the <a href="/admin/ui/">overview</a>
+        page in <em>recent deliveries</em>, and in <a href="/admin/ui/logs">logs</a>
+        as it processes.
+      </p>
+      <p>
+        <strong>tip:</strong> change <code>"entity"</code> on each test or use
+        <code>make admin-dedup-clear</code> first - the dedup window will
+        otherwise drop the second identical send.
+      </p>
+    </div>
+
+    <div class="footer">
+      <span>signed in as {{ .User }}</span>
+      <span>real events, real pipeline, real deliveries</span>
+    </div>
+  </div>
+
+  <script src="/admin/ui/static/test.js"></script>
+</body>
+</html>

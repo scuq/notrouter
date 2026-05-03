@@ -2,19 +2,19 @@
 // The store lives at a configurable path (default /var/lib/notrouter/creds.json)
 // so it can be a separate writable volume from the read-only config bind mount.
 //
-// Schema:
+// Schema v2 (current):
 //
 //	{
-//	  "admin": {
-//	    "password_hash": "$2a$10$...",
-//	    "must_change": true,
-//	    "updated_at": "2026-05-03T12:00:00Z"
-//	  },
-//	  "oidc": null
+//	  "version": 2,
+//	  "admin": {"password_hash": "$2a$...", "must_change": false, "updated_at": "..."},
+//	  "oidc":   null | { issuer, client_id, client_secret, ... },
+//	  "users":  {},   // populated by OIDC logins (planned v0.3)
+//	  "tokens": {}    // API tokens keyed by sha256(value) (planned v0.2.2)
 //	}
 //
-// The OIDC slot is reserved for a future iteration. Today it stays nil and
-// the file shape is fixed so we don't have to migrate later.
+// Schema v1 (legacy): no "version" field, only "admin" and "oidc".
+// Read-time migration upgrades v1 -> v2 silently and writes back, preserving
+// the admin entry untouched.
 package creds
 
 import (
@@ -30,29 +30,33 @@ import (
 )
 
 const (
-	// bcryptCost is the work factor. 10 is the bcrypt default and gives
-	// ~60ms verify on modest hardware - fine for admin login frequency,
-	// expensive enough to make brute-force attacks infeasible.
+	// bcryptCost is the work factor. 10 = ~60ms verify, fine for login,
+	// expensive enough vs brute force on a leaked file.
 	bcryptCost = 10
 
 	// initialPasswordPlain is what the file gets seeded with when missing.
-	// MustChange is set so the first login forces a rotation.
 	initialPasswordPlain = "admin"
+
+	// CurrentSchemaVersion is the version we write. Reads accept v1 (no
+	// "version" field) and migrate.
+	CurrentSchemaVersion = 2
 )
 
 // Store is a thread-safe credentials accessor backed by a JSON file.
-// Reads are cheap (in-memory); writes acquire the lock and persist.
 type Store struct {
 	path string
 	mu   sync.RWMutex
 	data fileShape
 }
 
-// fileShape is the exact JSON layout. Keep field tags stable; adding
-// fields is fine, renaming requires a migration plan.
+// fileShape is the exact JSON layout. New fields are additive; renaming
+// requires a schema bump.
 type fileShape struct {
-	Admin AdminCreds `json:"admin"`
-	OIDC  *OIDCCreds `json:"oidc,omitempty"`
+	Version int                    `json:"version"`
+	Admin   AdminCreds             `json:"admin"`
+	OIDC    *OIDCCreds             `json:"oidc,omitempty"`
+	Users   map[string]UserRecord  `json:"users,omitempty"`
+	Tokens  map[string]TokenRecord `json:"tokens,omitempty"`
 }
 
 type AdminCreds struct {
@@ -62,16 +66,40 @@ type AdminCreds struct {
 }
 
 // OIDCCreds is reserved for future use. Field shape is intentionally
-// generic - we'll fill it in once we know exactly what flow we want.
+// generic for now - the v0.3 OIDC pass may reshape it.
 type OIDCCreds struct {
-	Issuer       string `json:"issuer,omitempty"`
-	ClientID     string `json:"client_id,omitempty"`
-	ClientSecret string `json:"client_secret,omitempty"`
+	Issuer        string   `json:"issuer,omitempty"`
+	ClientID      string   `json:"client_id,omitempty"`
+	ClientSecret  string   `json:"client_secret,omitempty"`
+	RedirectURL   string   `json:"redirect_url,omitempty"`
+	Scopes        []string `json:"scopes,omitempty"`
+	UsernameClaim string   `json:"username_claim,omitempty"`
+	GroupsClaim   string   `json:"groups_claim,omitempty"`
+	AdminGroups   []string `json:"admin_groups,omitempty"`
+}
+
+// UserRecord is bookkeeping for an OIDC user. Identity is the OIDC
+// subject claim; everything else is informational.
+type UserRecord struct {
+	Subject     string    `json:"subject"`
+	Email       string    `json:"email,omitempty"`
+	FirstSeenAt time.Time `json:"first_seen_at"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
+}
+
+// TokenRecord describes one API token. Keyed in fileShape.Tokens by the
+// SHA-256 of the token value (so leaking creds.json doesn't reveal usable
+// tokens). Implementation lands in v0.2.2.
+type TokenRecord struct {
+	User       string    `json:"user"`
+	Label      string    `json:"label,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	LastUsedAt time.Time `json:"last_used_at,omitempty"`
 }
 
 // Open returns a Store, creating the file with default credentials if
-// missing. On first run the admin password is "admin" with MustChange=true,
-// matching the agreed first-run UX.
+// missing. Migrates legacy schemas in-place on first read.
 func Open(path string) (*Store, error) {
 	s := &Store{path: path}
 	if err := s.load(); err != nil {
@@ -80,6 +108,14 @@ func Open(path string) (*Store, error) {
 		}
 		if err := s.seedInitial(); err != nil {
 			return nil, fmt.Errorf("seed initial creds: %w", err)
+		}
+		return s, nil
+	}
+
+	// Successful load. If we read an old-schema file, migrate and persist.
+	if s.migrateIfNeeded() {
+		if err := s.persist(); err != nil {
+			return nil, fmt.Errorf("persist migrated creds: %w", err)
 		}
 	}
 	return s, nil
@@ -95,6 +131,37 @@ func (s *Store) load() error {
 	return json.Unmarshal(b, &s.data)
 }
 
+// migrateIfNeeded brings older schema versions up to CurrentSchemaVersion.
+// Returns true if a migration happened and persist is needed.
+//
+// v1 (no version field) -> v2: just stamp version and ensure maps exist.
+func (s *Store) migrateIfNeeded() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.data.Version >= CurrentSchemaVersion {
+		// Already current. Still ensure maps are non-nil so callers can
+		// write directly without nil-check; this isn't a "migration" per
+		// se but cheap and harmless.
+		s.ensureMaps()
+		return false
+	}
+
+	// v0/v1 -> v2.
+	s.data.Version = 2
+	s.ensureMaps()
+	return true
+}
+
+func (s *Store) ensureMaps() {
+	if s.data.Users == nil {
+		s.data.Users = make(map[string]UserRecord)
+	}
+	if s.data.Tokens == nil {
+		s.data.Tokens = make(map[string]TokenRecord)
+	}
+}
+
 func (s *Store) seedInitial() error {
 	hash, err := bcrypt.GenerateFromPassword([]byte(initialPasswordPlain), bcryptCost)
 	if err != nil {
@@ -102,19 +169,21 @@ func (s *Store) seedInitial() error {
 	}
 	s.mu.Lock()
 	s.data = fileShape{
+		Version: CurrentSchemaVersion,
 		Admin: AdminCreds{
 			PasswordHash: string(hash),
 			MustChange:   true,
 			UpdatedAt:    time.Now().UTC(),
 		},
+		Users:  make(map[string]UserRecord),
+		Tokens: make(map[string]TokenRecord),
 	}
 	s.mu.Unlock()
 	return s.persist()
 }
 
-// persist writes atomically: write to a temp file in the same dir, then
-// rename. This avoids a half-written creds.json if the process is killed
-// mid-write, which would lock everyone out.
+// persist writes atomically: write to temp + rename. Avoids a half-
+// written file locking everyone out if the process is killed mid-write.
 func (s *Store) persist() error {
 	s.mu.RLock()
 	b, err := json.MarshalIndent(s.data, "", "  ")
@@ -148,7 +217,7 @@ func (s *Store) persist() error {
 }
 
 // Verify checks a plaintext password against the stored hash.
-// Constant-time-equivalent via bcrypt's own internals.
+// Constant-time-equivalent via bcrypt internals.
 func (s *Store) Verify(plain string) bool {
 	s.mu.RLock()
 	hash := s.data.Admin.PasswordHash
@@ -160,24 +229,21 @@ func (s *Store) Verify(plain string) bool {
 }
 
 // MustChange returns whether the admin password is still the seed value.
-// The UI uses this to force a redirect to the change-password page.
 func (s *Store) MustChange() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.data.Admin.MustChange
 }
 
-// UpdatedAt returns when the password was last changed; surfaced on the
-// dashboard so operators can spot stale credentials.
+// UpdatedAt returns when the password was last changed.
 func (s *Store) UpdatedAt() time.Time {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.data.Admin.UpdatedAt
 }
 
-// SetPassword updates the admin password, clears MustChange, and persists.
-// Caller is responsible for verifying the OLD password first; this function
-// trusts that the caller has the right.
+// SetPassword updates the admin password, clears MustChange, persists.
+// Caller is responsible for verifying the OLD password first.
 func (s *Store) SetPassword(newPlain string) error {
 	if len(newPlain) < 8 {
 		return errors.New("password must be at least 8 characters")
@@ -192,4 +258,12 @@ func (s *Store) SetPassword(newPlain string) error {
 	s.data.Admin.UpdatedAt = time.Now().UTC()
 	s.mu.Unlock()
 	return s.persist()
+}
+
+// SchemaVersion returns the current persisted schema version. Useful for
+// tests and the about page.
+func (s *Store) SchemaVersion() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.data.Version
 }

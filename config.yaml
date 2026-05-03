@@ -14,7 +14,6 @@ auth:
     # Username for legacy basic auth on /admin/state, /admin/deliveries,
     # /admin/dedup/clear. The web UI password is managed in creds_path.
     username: admin
-    password: "CHANGE_ME_to_something_strong"
 
     # Persisted credentials file. First run seeds it with admin/admin and
     # MustChange=true; the UI forces a password rotation on first login.

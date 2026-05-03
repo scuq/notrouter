@@ -480,3 +480,42 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
   margin-bottom: 1rem;
   letter-spacing: .5px;
 }
+/* === test event page === */
+
+.test-form {
+  display: flex;
+  gap: 1rem;
+  align-items: end;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+.test-form label.inline {
+  display: flex;
+  flex-direction: column;
+  gap: .25rem;
+  margin: 0;
+  flex: 1;
+  min-width: 240px;
+}
+.test-form label.inline > span {
+  font-size: .72rem;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: #1ea53a;
+  text-shadow: 0 0 3px rgba(30, 165, 58, .3);
+}
+.test-form select {
+  width: 100%;
+  margin: 0;
+  padding: .45rem .6rem;
+  background: #000;
+  color: #00ff41;
+  border: 1px solid #1ea53a;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: .9rem;
+  outline: none;
+}
+.test-form select:focus {
+  border-color: #00ff41;
+  box-shadow: 0 0 8px rgba(0, 255, 65, .3);
+}

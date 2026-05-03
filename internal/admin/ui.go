@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -26,6 +28,7 @@ type uiHandler struct {
 	tmplChangePw *template.Template
 	tmplConfig   *template.Template
 	tmplLogs     *template.Template
+	tmplTest     *template.Template
 	staticFS     http.FileSystem
 	store        *SessionStore
 	creds        credsAccessor
@@ -33,18 +36,16 @@ type uiHandler struct {
 	log          *slog.Logger
 	logs         *logbuffer.Buffer
 
-	// rt holds the live reloader. Probes() and CurrentConfig() come from
-	// the currently-running pipeline. Always go through these methods so
-	// post-reload references update automatically.
 	rtMu sync.RWMutex
 	rt   reloaderAccessor
 
 	credsPath string
+
+	// httpClient is reused for the test-event loopback. Single client
+	// across requests gives us connection reuse to the local webhook.
+	httpClient *http.Client
 }
 
-// reloaderAccessor decouples admin from the runtime package - we don't
-// import runtime here, runtime imports admin (for Probes type). This
-// avoids the import cycle while letting us call into the reloader.
 type reloaderAccessor interface {
 	CurrentConfig() *config.Config
 	LKGConfig() *config.Config
@@ -52,8 +53,6 @@ type reloaderAccessor interface {
 	Probes() Probes
 }
 
-// ReloadResult mirrors runtime.ReloadResult so we can return it as JSON
-// without importing runtime. The runtime package wraps this.
 type ReloadResult struct {
 	OK              bool   `json:"ok"`
 	AppliedHash     string `json:"applied_hash,omitempty"`
@@ -98,6 +97,10 @@ func newUIHandler(
 	if err != nil {
 		return nil, err
 	}
+	testTpl, err := template.ParseFS(uiFS, "ui/test.html")
+	if err != nil {
+		return nil, err
+	}
 	staticSub, err := fs.Sub(uiFS, "ui/static")
 	if err != nil {
 		return nil, err
@@ -108,6 +111,7 @@ func newUIHandler(
 		tmplChangePw: cpwTpl,
 		tmplConfig:   configTpl,
 		tmplLogs:     logsTpl,
+		tmplTest:     testTpl,
 		staticFS:     http.FS(staticSub),
 		store:        store,
 		creds:        creds,
@@ -116,6 +120,10 @@ func newUIHandler(
 		rt:           rt,
 		credsPath:    credsPath,
 		logs:         logs,
+		// 10s timeout is plenty - the webhook receiver returns 202 within
+		// microseconds. If something is wrong we want to know fast, not
+		// hang the UI.
+		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}, nil
 }
 
@@ -125,6 +133,7 @@ func (h *uiHandler) register(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/ui/change-password", h.requireSession(h.handleChangePasswordPage))
 	mux.HandleFunc("/admin/ui/config", h.requireSession(h.handleConfigPage))
 	mux.HandleFunc("/admin/ui/logs", h.requireSession(h.handleLogsPage))
+	mux.HandleFunc("/admin/ui/test", h.requireSession(h.handleTestPage))
 	mux.HandleFunc("/admin/ui/", h.requireSession(h.handleDashboard))
 	mux.HandleFunc("/admin/ui", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin/ui/", http.StatusFound)
@@ -138,10 +147,11 @@ func (h *uiHandler) register(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/config", h.requireSession(h.handleAPIConfig))
 	mux.HandleFunc("/admin/api/logs", h.requireSession(h.handleAPILogs))
 
-	// Editor endpoints. All POST, all CSRF-protected.
 	mux.HandleFunc("/admin/api/config/validate", h.requireSession(h.handleAPIConfigValidate))
 	mux.HandleFunc("/admin/api/config/save", h.requireSession(h.handleAPIConfigSave))
 	mux.HandleFunc("/admin/api/config/reload", h.requireSession(h.handleAPIConfigReload))
+
+	mux.HandleFunc("/admin/api/test/send", h.requireSession(h.handleAPITestSend))
 }
 
 func (h *uiHandler) requireSession(next http.HandlerFunc) http.HandlerFunc {
@@ -183,8 +193,6 @@ func (h *uiHandler) writeCSRFCookie(w http.ResponseWriter, r *http.Request, valu
 		SameSite: http.SameSiteStrictMode,
 	})
 }
-
-// --- helpers for current state from reloader ---
 
 func (h *uiHandler) currentCfg() *config.Config {
 	h.rtMu.RLock()
@@ -271,7 +279,7 @@ func (h *uiHandler) handleConfigPage(w http.ResponseWriter, r *http.Request) {
 		"CSRF":       csrf,
 		"Version":    version.Version,
 		"Commit":     version.Commit,
-		"Links":      h.currentCfg().Links,
+		"Links":      cfg.Links,
 		"ConfigPath": configPath,
 		"LoadedHash": loadedHash,
 		"DiskHash":   diskHash,
@@ -298,6 +306,22 @@ func (h *uiHandler) handleLogsPage(w http.ResponseWriter, r *http.Request) {
 		"Version": version.Version,
 		"Commit":  version.Commit,
 		"Links":   h.currentCfg().Links,
+	})
+}
+
+func (h *uiHandler) handleTestPage(w http.ResponseWriter, r *http.Request) {
+	user := r.Header.Get("X-Notrouter-User")
+	_, csrf, _ := h.store.Get(readSessionCookie(r))
+	h.writeCSRFCookie(w, r, csrf)
+	cfg := h.currentCfg()
+	h.renderTemplate(w, h.tmplTest, map[string]interface{}{
+		"User":        user,
+		"CSRF":        csrf,
+		"Version":     version.Version,
+		"Commit":      version.Commit,
+		"Links":       cfg.Links,
+		"Endpoints":   cfg.Receivers.Webhook.Endpoints,
+		"WebhookAddr": cfg.Listen.Webhook,
 	})
 }
 
@@ -471,15 +495,11 @@ func (h *uiHandler) handleAPILogs(w http.ResponseWriter, r *http.Request) {
 
 // --- API: editor (validate / save / reload) ---
 
-// editRequest is the JSON body shape the editor JS posts. Body is the
-// proposed YAML; ExpectedDiskHash supports optimistic concurrency.
 type editRequest struct {
 	Body             string `json:"body"`
 	ExpectedDiskHash string `json:"expected_disk_hash"`
 }
 
-// handleAPIConfigValidate parses+validates without touching disk or pipeline.
-// Returns {ok:true} or {ok:false, error:"..."}.
 func (h *uiHandler) handleAPIConfigValidate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
@@ -504,9 +524,6 @@ func (h *uiHandler) handleAPIConfigValidate(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 }
 
-// handleAPIConfigSave writes the new YAML to disk atomically with a
-// timestamped backup. Does NOT apply to the running pipeline. Returns
-// 409 if disk hash changed since the user started editing.
 func (h *uiHandler) handleAPIConfigSave(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
@@ -550,9 +567,6 @@ func (h *uiHandler) handleAPIConfigSave(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// handleAPIConfigReload re-reads the disk file and tells the reloader to
-// rebuild the pipeline. The reloader handles LKG fallback internally;
-// we just translate the result into JSON.
 func (h *uiHandler) handleAPIConfigReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
@@ -597,8 +611,100 @@ func (h *uiHandler) handleAPIConfigReload(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, out)
 }
 
-// readEditRequest parses the JSON body and sanity-checks size. Hard
-// cap at 1 MB so a user can't OOM us with a giant paste.
+// --- API: send test event ---
+
+type testSendRequest struct {
+	Path    string          `json:"path"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+// handleAPITestSend POSTs the operator-provided payload to the local
+// webhook receiver. We don't bypass the receiver - the point is to fire
+// a real event through the entire pipeline so its behavior matches what
+// production traffic would look like.
+//
+// Resolves the webhook listen address ("127.0.0.1:<port>" if listen is
+// ":<port>", otherwise as configured) and reuses the ui handler's
+// httpClient for connection pooling on rapid-fire testing.
+func (h *uiHandler) handleAPITestSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.checkCSRFHeader(r); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{"error": "invalid csrf"})
+		return
+	}
+	req := &testSendRequest{}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": "bad request body: " + err.Error()})
+		return
+	}
+	if req.Path == "" || req.Path[0] != '/' {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": "path must start with /"})
+		return
+	}
+	if len(req.Payload) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": "payload is required"})
+		return
+	}
+
+	cfg := h.currentCfg()
+	target := loopbackURL(cfg.Listen.Webhook) + req.Path
+
+	h.log.Info("test event from UI",
+		"user", r.Header.Get("X-Notrouter-User"),
+		"target", target,
+		"size", len(req.Payload))
+
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", target, bytes.NewReader(req.Payload))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	upstreamReq.Header.Set("Content-Type", "application/json")
+	upstreamReq.Header.Set("X-Notrouter-Test", "1")
+
+	resp, err := h.httpClient.Do(upstreamReq)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"error":           "loopback to webhook receiver failed: " + err.Error(),
+			"target":          target,
+			"upstream_status": 0,
+		})
+		return
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"target":          target,
+		"upstream_status": resp.StatusCode,
+		"upstream_body":   string(respBody),
+	})
+}
+
+// loopbackURL constructs an http://127.0.0.1:<port> URL for the webhook
+// receiver. Receiver listens on the address from cfg.Listen.Webhook, but
+// that's typically ":8080" - we rewrite host to localhost for the loop.
+//
+// IPv6 listeners ("[::]:8080") get the same treatment - we always use
+// 127.0.0.1 because the webhook receiver also listens there by virtue
+// of binding the wildcard.
+func loopbackURL(listen string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		// listen is malformed; fall back to using it as-is.
+		return "http://" + listen
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port)
+}
+
+// --- helpers ---
+
 func readEditRequest(r *http.Request) (*editRequest, error) {
 	r.Body = http.MaxBytesReader(nil, r.Body, 1<<20)
 	defer r.Body.Close()
@@ -613,9 +719,6 @@ func readEditRequest(r *http.Request) (*editRequest, error) {
 	return req, nil
 }
 
-// --- helpers ---
-
-// checkCSRF used by the legacy form-encoded handlers.
 func (h *uiHandler) checkCSRF(r *http.Request) error {
 	cookie, err := r.Cookie(csrfCookieName)
 	if err != nil {
@@ -635,8 +738,6 @@ func (h *uiHandler) checkCSRF(r *http.Request) error {
 	return nil
 }
 
-// checkCSRFHeader handles the JSON-body editor calls. The JS sends the
-// CSRF token via X-CSRF-Token header (form bodies aren't being parsed).
 func (h *uiHandler) checkCSRFHeader(r *http.Request) error {
 	cookie, err := r.Cookie(csrfCookieName)
 	if err != nil {

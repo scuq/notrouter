@@ -54,6 +54,16 @@ func run(configPath string) error {
 		"loaded_hash", cfg.LoadedHash(),
 		"plugins", plugins.Types())
 
+	// Loud, unmissable warning if the operator still has the deprecated
+	// password field set in their YAML. The value is ignored; the source
+	// of truth for both basic auth and the web UI is creds.json.
+	if cfg.DeprecatedPasswordSet() {
+		log.Warn("auth.admin.password in config.yaml is DEPRECATED and IGNORED",
+			"action", "remove this key from your YAML",
+			"new_source", cfg.Auth.Admin.CredsPath,
+			"how_to_change", "log in to the web UI and use 'change password'")
+	}
+
 	credStore, err := creds.Open(cfg.Auth.Admin.CredsPath)
 	if err != nil {
 		return fmt.Errorf("open creds store: %w", err)
@@ -62,14 +72,14 @@ func run(configPath string) error {
 		log.Warn("admin password is the seed value - login will force a change",
 			"creds_path", cfg.Auth.Admin.CredsPath)
 	} else {
-		log.Info("admin creds loaded", "updated_at", credStore.UpdatedAt())
+		log.Info("admin creds loaded",
+			"updated_at", credStore.UpdatedAt(),
+			"schema_version", credStore.SchemaVersion())
 	}
 
 	parentCtx, cancelParent := context.WithCancel(context.Background())
 	defer cancelParent()
 
-	// Initial pipeline. Build+Start as one unit so a port conflict at
-	// startup fails the binary immediately, like it always has.
 	initial, err := runtime.Build(cfg, log)
 	if err != nil {
 		return fmt.Errorf("build initial pipeline: %w", err)
@@ -78,15 +88,11 @@ func run(configPath string) error {
 		return fmt.Errorf("start initial pipeline: %w", err)
 	}
 
-	// Reloader manages all subsequent pipeline lifecycle. The admin
-	// server holds a reference and uses it for both probes (which point
-	// at the live pipeline) and for triggering reloads.
 	reloader := runtime.NewReloader(parentCtx, log, initial)
 
 	adm, err := admin.NewWithUI(
 		cfg.Listen.Admin,
 		cfg.Auth.Admin.Username,
-		cfg.Auth.Admin.Password,
 		credStore,
 		cfg.Auth.Admin.SessionTTL,
 		log,
@@ -99,9 +105,6 @@ func run(configPath string) error {
 		return fmt.Errorf("build admin: %w", err)
 	}
 
-	// Admin server has its own goroutine accounting because it must
-	// survive across pipeline reloads. Use a separate WaitGroup, not
-	// the pipeline's.
 	var adminWg sync.WaitGroup
 	if err := adm.Start(parentCtx, &adminWg); err != nil {
 		initial.Stop()
@@ -113,8 +116,6 @@ func run(configPath string) error {
 	s := <-sig
 	log.Info("shutdown signal received", "signal", s.String())
 
-	// Shut down: cancel root context (cascades to admin), stop the
-	// currently-running pipeline.
 	cancelParent()
 	adminWg.Wait()
 	reloader.Current().Stop()

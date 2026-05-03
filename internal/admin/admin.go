@@ -20,7 +20,6 @@ const QueueDegradedRatio = 0.9
 type Server struct {
 	addr   string
 	user   string
-	pass   string
 	creds  credsAccessor
 	log    *slog.Logger
 	server *http.Server
@@ -31,12 +30,13 @@ type Server struct {
 	rt   reloaderAccessor
 }
 
-// NewWithUI wires the admin server with all UI dependencies including
-// the reloader. The admin server is reload-immune - it never gets torn
-// down by a reload.
+// NewWithUI wires the admin server. Basic auth on legacy endpoints uses
+// the username from config.yaml (which defaults to "admin") and the
+// bcrypt-hashed password from creds.json (Verify()). No plaintext
+// password is passed in - the password lives only in creds.json.
 func NewWithUI(
 	addr string,
-	basicUser, basicPass string,
+	basicUser string,
 	creds credsAccessor,
 	sessionTTL time.Duration,
 	log *slog.Logger,
@@ -52,7 +52,6 @@ func NewWithUI(
 	return &Server{
 		addr:  addr,
 		user:  basicUser,
-		pass:  basicPass,
 		creds: creds,
 		log:   log,
 		store: store,
@@ -118,6 +117,12 @@ func (s *Server) currentProbes() Probes {
 	return s.rt.Probes()
 }
 
+// dualAuth accepts either a valid session cookie or HTTP basic auth.
+// Basic auth: username compared in constant time, password verified
+// against the bcrypt hash in creds.json. Each basic auth request thus
+// pays ~10ms of bcrypt cost - acceptable for the small volume of admin
+// API calls. If you hammer it with monitoring scripts, mint an API
+// token instead (planned v0.2.2) - that path skips bcrypt.
 func (s *Server) dualAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if sid := readSessionCookie(r); sid != "" {
@@ -129,7 +134,7 @@ func (s *Server) dualAuth(next http.Handler) http.Handler {
 		u, p, ok := r.BasicAuth()
 		if ok &&
 			subtle.ConstantTimeCompare([]byte(u), []byte(s.user)) == 1 &&
-			subtle.ConstantTimeCompare([]byte(p), []byte(s.pass)) == 1 {
+			s.creds.Verify(p) {
 			next.ServeHTTP(w, r)
 			return
 		}
