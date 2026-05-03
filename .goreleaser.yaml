@@ -10,15 +10,19 @@ builds:
     binary: notrouter
     env:
       - CGO_ENABLED=0
-    goos: [linux, darwin]
-    goarch: [amd64, arm64]
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
     ldflags:
       - -s -w
       - -X github.com/scuq/notrouter/internal/version.Version={{.Version}}
       - -X github.com/scuq/notrouter/internal/version.Commit={{.ShortCommit}}
 
 archives:
-  - format: tar.gz
+  - formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - README.md
@@ -28,12 +32,12 @@ checksum:
   name_template: "checksums.txt"
 
 snapshot:
-  version_template: "{{ .Tag }}-next"
+  version_template: "{{ .Tag }}-snapshot"
 
 changelog:
   sort: asc
   filters:
     exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
+      - '^docs:'
+      - '^test:'
+      - '^chore:'

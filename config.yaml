@@ -1,0 +1,124 @@
+listen:
+  webhook: ":8080"
+  syslog_udp: ":5514"
+  syslog_tcp: ":5514"
+  admin: ":9090"
+
+auth:
+  admin:
+    username: admin
+    password: admin
+
+receivers:
+  webhook:
+    endpoints:
+      - path: /webhook/nagios
+        profile: nagios
+      - path: /webhook/generic
+        profile: generic
+
+profiles:
+  nagios:
+    entity:
+      from_json: "$.host"
+    normalize:
+      topic: "nagios-{{.json.type}}-{{.json.state | lower}}"
+      urgency:
+        from_json: "$.state"
+        map:
+          OK: info
+          UP: info
+          WARNING: medium
+          CRITICAL: critical
+          DOWN: high
+          UNREACHABLE: high
+    # Pull payload fields into Event.Attributes so plugin templates can use
+    # them. Existing attributes are not overwritten.
+    attributes:
+      msg:
+        from_json: "$.output"
+      service:
+        from_json: "$.service"
+      source_kind:
+        static: "nagios"
+
+  generic:
+    entity:
+      from_json: "$.entity"
+
+dedup:
+  ttl: 5m
+  key_fields: [entity, topic]
+
+suppressors:
+  - name: ignore-test-hosts
+    match:
+      entity_regex: "^test-.*"
+
+logging:
+  level: info
+  suppressor_log_throttle: 60s
+
+plugin_instances:
+  stdout_debug:
+    type: stdout
+    config: {}
+
+  file_audit:
+    type: file
+    config:
+      path: /tmp/notrouter-audit.jsonl
+
+  # Real Webex Incoming Webhook. Replace webhook_url with your room's URL.
+  # Defaults: 10s timeout, 2s rate-limit grace, default markdown template
+  # with emoji eyecatcher matching the Nagios Python script.
+  webex_noc:
+    type: webex
+    config:
+      webhook_url: "https://webexapis.com/v1/webhooks/incoming/REPLACE_ME"
+      timeout: "15s"
+      rate_limit_grace: "2s"
+    retry:
+      attempts: 5
+      backoff: [2s, 5s, 10s, 30s, 60s]
+
+  # Generic webhook example - works for Slack, Mattermost, custom endpoints.
+  # Without a template it sends the canonical event as JSON.
+  generic_hook:
+    type: webhook
+    config:
+      webhook_url: "http://127.0.0.1:9999/notify"
+      content_type: "application/json"
+      timeout: "10s"
+      template: |
+        {"text":"[{{.Urgency}}] {{.Topic}} on {{.Entity}}{{ if .Attributes.msg }} - {{.Attributes.msg}}{{ end }}"}
+
+  # Failer plugin - exercises retry/partial-delivery paths. Add to a group
+  # only when you want to see failure metrics in action.
+  test_failer:
+    type: failer
+    config:
+      mode: "always"
+
+groups:
+  noc-team:
+    subscribers: [stdout_debug, file_audit, test_failer]
+  test-failure-paths:
+    subscribers: [stdout_debug, test_failer]
+
+routing:
+  - match: {}
+    groups: [noc-team]
+
+dispatch:
+  global_delivery_ttl: 30m
+  default_retry:
+    attempts: 3
+    backoff: [1s, 5s, 30s]
+
+pipeline:
+  raw_buffer_size: 4096
+  normal_buffer_size: 2048
+  instance_buffer_size: 1024
+  resolver_workers: 4
+  normalizer_workers: 4

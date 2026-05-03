@@ -1,7 +1,6 @@
 .git
 .github
-bin/
+bin
 *.log
-notrouter.log
-.idea
-.vscode
+*.jsonl
+README.md
