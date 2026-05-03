@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>notrouter // dashboard</title>
+  <link rel="stylesheet" href="/admin/ui/static/style.css">
+</head>
+<body class="app-page">
+  <div class="terminal">
+    <div class="terminal-header">
+      <h1>notrouter // dashboard</h1>
+      <nav class="nav">
+        <a href="/admin/ui/" class="active">overview</a>
+        <a href="/admin/ui/change-password">change password</a>
+        <form method="POST" action="/admin/api/logout" style="display:inline; margin:0;">
+          <input type="hidden" name="csrf" value="{{ .CSRF }}">
+          <button type="submit" style="all:unset; cursor:pointer; color:#007a1f; letter-spacing:1.5px; text-transform:uppercase; font-size:.75rem;" onmouseover="this.style.color='#00ff41'" onmouseout="this.style.color='#007a1f'">logout</button>
+        </form>
+      </nav>
+    </div>
+
+    <h2>system</h2>
+    <div class="metric-grid" id="metrics-overview">
+      <div class="metric">
+        <span class="label">version</span>
+        <span class="value">{{ .Version }}</span>
+      </div>
+      <div class="metric">
+        <span class="label">commit</span>
+        <span class="value">{{ .Commit }}</span>
+      </div>
+      <div class="metric">
+        <span class="label">dedup entries</span>
+        <span class="value" id="m-dedup">-</span>
+      </div>
+      <div class="metric">
+        <span class="label">tracker pending</span>
+        <span class="value" id="m-pending">-</span>
+      </div>
+    </div>
+
+    <h2>plugin queues</h2>
+    <table id="queues-table">
+      <thead>
+        <tr><th>instance</th><th>depth</th><th>capacity</th><th>util</th></tr>
+      </thead>
+      <tbody id="queues-tbody">
+        <tr><td colspan="4" style="color:#007a1f">loading_</td></tr>
+      </tbody>
+    </table>
+
+    <h2>recent deliveries</h2>
+    <table id="deliveries-table">
+      <thead>
+        <tr><th>finalized</th><th>state</th><th>event</th><th>subscribers</th></tr>
+      </thead>
+      <tbody id="deliveries-tbody">
+        <tr><td colspan="4" style="color:#007a1f">loading_</td></tr>
+      </tbody>
+    </table>
+
+    <div class="footer">
+      <span>signed in as {{ .User }}</span>
+      <span id="last-update">-</span>
+    </div>
+  </div>
+
+  <script src="/admin/ui/static/app.js"></script>
+</body>
+</html>

@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -10,41 +11,51 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/scuq/notrouter/internal/auth"
 	"github.com/scuq/notrouter/internal/version"
 )
 
-// QueueDegradedRatio is the threshold at which /healthz reports degraded.
-// 0.9 = degraded if any instance queue is >=90% full.
 const QueueDegradedRatio = 0.9
 
 type Server struct {
-	addr   string
-	user   string
-	pass   string
-	probes Probes
-	log    *slog.Logger
-	server *http.Server
+	addr    string
+	user    string
+	pass    string
+	creds   credsAccessor
+	probes  Probes
+	log     *slog.Logger
+	server  *http.Server
+	store   *SessionStore
+	uiH     *uiHandler
 }
 
-func New(addr, user, pass string, probes Probes, log *slog.Logger) *Server {
-	return &Server{addr: addr, user: user, pass: pass, probes: probes, log: log}
+// NewWithUI is the new constructor used in pass 5a. Takes the credentials
+// store and session TTL so the UI can do real auth. The legacy `New(...)`
+// signature is kept as a thin wrapper so older code compiles unchanged
+// during the upgrade.
+func NewWithUI(addr string, basicUser, basicPass string, creds credsAccessor, sessionTTL time.Duration, probes Probes, log *slog.Logger) (*Server, error) {
+	store := NewSessionStore(sessionTTL)
+	uiH, err := newUIHandler(store, creds, probes, sessionTTL, log)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{
+		addr:   addr,
+		user:   basicUser,
+		pass:   basicPass,
+		creds:  creds,
+		probes: probes,
+		log:    log,
+		store:  store,
+		uiH:    uiH,
+	}, nil
 }
 
 func (s *Server) Start(ctx context.Context, wg *sync.WaitGroup) error {
 	mux := http.NewServeMux()
 
-	// /healthz reports degraded when any per-instance queue is near-full.
-	// We pick a hard 90% threshold rather than a moving-average; simple
-	// metrics are easier to alert on and easier to reason about.
+	// Public endpoints (no auth).
 	mux.HandleFunc("/healthz", s.handleHealthz)
-
-	// /metrics is unauthenticated by convention - Prometheus scrapers
-	// shouldn't need credentials and network controls protect it.
 	mux.Handle("/metrics", promhttp.Handler())
-
-	// /version is unauthenticated and useful for blue/green deploys to
-	// confirm which build is live without poking around the container.
 	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"version": version.Version,
@@ -52,17 +63,20 @@ func (s *Server) Start(ctx context.Context, wg *sync.WaitGroup) error {
 		})
 	})
 
-	// All /admin/* routes require basic auth.
-	adminMux := http.NewServeMux()
-	adminMux.HandleFunc("/admin/state", s.handleState)
-	adminMux.HandleFunc("/admin/deliveries", s.handleDeliveries)
-	adminMux.HandleFunc("/admin/dedup/clear", s.handleDedupClear)
-	adminMux.HandleFunc("/admin/", s.handleAdminIndex)
+	// Web UI (session-cookie auth).
+	s.uiH.register(mux)
 
-	mux.Handle("/admin/", auth.BasicAuth(s.user, s.pass, adminMux))
+	// Legacy admin JSON endpoints accept basic auth OR session cookie.
+	// Existing scripts using -u admin:pass keep working; the UI's session
+	// cookie also unlocks them. New code should prefer /admin/api/*.
+	dual := s.dualAuth(http.HandlerFunc(s.handleLegacyMux))
+	mux.Handle("/admin/state", dual)
+	mux.Handle("/admin/deliveries", dual)
+	mux.Handle("/admin/dedup/clear", dual)
+	mux.Handle("/admin/", dual)
 
-	// Bare / for backwards compat: simple banner behind auth.
-	mux.Handle("/", auth.BasicAuth(s.user, s.pass, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Bare / behind dual auth, simple banner.
+	mux.Handle("/", s.dualAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("notrouter admin\n"))
 	})))
 
@@ -93,11 +107,48 @@ func (s *Server) Start(ctx context.Context, wg *sync.WaitGroup) error {
 	return nil
 }
 
-// handleHealthz returns 200 + ok, or 503 + JSON describing what's degraded.
-// Three signals can flip to degraded:
-//   - any plugin instance queue is >=90% full
-//   - the tracker has more than 10000 pending deliveries (something is stuck)
-//   - the dedup map has more than 1000000 entries (config bug or memory leak)
+// dualAuth accepts either a valid session cookie or HTTP basic auth.
+// On failure it returns 401 with WWW-Authenticate so curl users get
+// a prompt; UI users will already have a cookie.
+func (s *Server) dualAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Session cookie path.
+		if sid := readSessionCookie(r); sid != "" {
+			if _, _, ok := s.store.Get(sid); ok {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		// Basic auth path.
+		u, p, ok := r.BasicAuth()
+		if ok &&
+			subtle.ConstantTimeCompare([]byte(u), []byte(s.user)) == 1 &&
+			subtle.ConstantTimeCompare([]byte(p), []byte(s.pass)) == 1 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="notrouter"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	})
+}
+
+// handleLegacyMux dispatches to the existing handler functions. Using a
+// single-mux pattern keeps the dual-auth wrapper in one place.
+func (s *Server) handleLegacyMux(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/admin/state":
+		s.handleState(w, r)
+	case "/admin/deliveries":
+		s.handleDeliveries(w, r)
+	case "/admin/dedup/clear":
+		s.handleDedupClear(w, r)
+	case "/admin/":
+		s.handleAdminIndex(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	type queueReport struct {
 		QueueState
@@ -143,16 +194,14 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
-		"status":           "degraded",
-		"reasons":          degraded,
-		"queues":           queues,
-		"tracker_pending":  pending,
-		"dedup_size":       dedupSize,
+		"status":          "degraded",
+		"reasons":         degraded,
+		"queues":          queues,
+		"tracker_pending": pending,
+		"dedup_size":      dedupSize,
 	})
 }
 
-// handleState bundles all read-only introspection in one call. Useful for
-// diagnostics scripts; keeps each individual endpoint cheap.
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	state := map[string]interface{}{
 		"version": map[string]string{
@@ -183,9 +232,6 @@ func (s *Server) handleDeliveries(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleDedupClear is the panic button: after a config rollout that botched
-// dedup keys, you want to wipe the in-memory map without a process restart.
-// POST only - GET shouldn't have side effects.
 func (s *Server) handleDedupClear(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
@@ -199,14 +245,14 @@ func (s *Server) handleDedupClear(w http.ResponseWriter, r *http.Request) {
 	s.probes.Dedup.Clear()
 	s.log.Warn("dedup cleared via admin endpoint", "previous_size", before)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"cleared": true,
+		"cleared":       true,
 		"previous_size": before,
 	})
 }
 
 func (s *Server) handleAdminIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte("notrouter admin\n\nendpoints:\n  GET  /admin/state\n  GET  /admin/deliveries\n  POST /admin/dedup/clear\n"))
+	w.Write([]byte("notrouter admin\n\nendpoints:\n  GET  /admin/state\n  GET  /admin/deliveries\n  POST /admin/dedup/clear\n  UI:  /admin/ui/\n"))
 }
 
 func writeJSON(w http.ResponseWriter, status int, body interface{}) {

@@ -35,8 +35,10 @@ type AuthConfig struct {
 }
 
 type AdminAuth struct {
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
+	Username   string        `yaml:"username"`
+	Password   string        `yaml:"password"`
+	CredsPath  string        `yaml:"creds_path"`
+	SessionTTL time.Duration `yaml:"session_ttl"`
 }
 
 type ReceiversConfig struct {
@@ -74,14 +76,10 @@ type UrgencyMapping struct {
 	Map      map[string]string `yaml:"map"`
 }
 
-// AttributeExtractor pulls a value from the raw payload into Event.Attributes
-// under a chosen key. The normalizer applies these AFTER the syslog preparse
-// so JSON-path lookups against webhook bodies work, but extracted values
-// don't clobber pre-existing attributes (so e.g. syslog "msg" survives).
 type AttributeExtractor struct {
 	FromJSON  string `yaml:"from_json,omitempty"`
-	FromField string `yaml:"from_field,omitempty"` // copy from existing attribute
-	Static    string `yaml:"static,omitempty"`     // literal value (e.g. tag)
+	FromField string `yaml:"from_field,omitempty"`
+	Static    string `yaml:"static,omitempty"`
 }
 
 type DedupConfig struct {
@@ -180,6 +178,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Auth.Admin.Password == "" {
 		c.Auth.Admin.Password = "admin"
+	}
+	if c.Auth.Admin.CredsPath == "" {
+		c.Auth.Admin.CredsPath = "/var/lib/notrouter/creds.json"
+	}
+	if c.Auth.Admin.SessionTTL == 0 {
+		c.Auth.Admin.SessionTTL = 2 * time.Hour
 	}
 	if c.Dedup.TTL == 0 {
 		c.Dedup.TTL = 5 * time.Minute

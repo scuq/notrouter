@@ -6,8 +6,18 @@ listen:
 
 auth:
   admin:
+    # Username for legacy basic auth on /admin/state, /admin/deliveries,
+    # /admin/dedup/clear. The web UI password is managed in creds_path.
     username: admin
-    password: admin
+    password: "CHANGE_ME_to_something_strong"
+
+    # Persisted credentials file. First run seeds it with admin/admin and
+    # MustChange=true; the UI forces a password rotation on first login.
+    # OIDC client config will land here in a future iteration.
+    creds_path: /var/lib/notrouter/creds.json
+
+    # Web UI session length. After this, users must log in again.
+    session_ttl: 2h
 
 receivers:
   webhook:
@@ -32,8 +42,6 @@ profiles:
           CRITICAL: critical
           DOWN: high
           UNREACHABLE: high
-    # Pull payload fields into Event.Attributes so plugin templates can use
-    # them. Existing attributes are not overwritten.
     attributes:
       msg:
         from_json: "$.output"
@@ -60,18 +68,6 @@ logging:
   suppressor_log_throttle: 60s
 
 plugin_instances:
-  stdout_debug:
-    type: stdout
-    config: {}
-
-  file_audit:
-    type: file
-    config:
-      path: /tmp/notrouter-audit.jsonl
-
-  # Real Webex Incoming Webhook. Replace webhook_url with your room's URL.
-  # Defaults: 10s timeout, 2s rate-limit grace, default markdown template
-  # with emoji eyecatcher matching the Nagios Python script.
   webex_noc:
     type: webex
     config:
@@ -82,29 +78,14 @@ plugin_instances:
       attempts: 5
       backoff: [2s, 5s, 10s, 30s, 60s]
 
-  # Generic webhook example - works for Slack, Mattermost, custom endpoints.
-  # Without a template it sends the canonical event as JSON.
-  generic_hook:
-    type: webhook
+  file_audit:
+    type: file
     config:
-      webhook_url: "http://127.0.0.1:9999/notify"
-      content_type: "application/json"
-      timeout: "10s"
-      template: |
-        {"text":"[{{.Urgency}}] {{.Topic}} on {{.Entity}}{{ if .Attributes.msg }} - {{.Attributes.msg}}{{ end }}"}
-
-  # Failer plugin - exercises retry/partial-delivery paths. Add to a group
-  # only when you want to see failure metrics in action.
-  test_failer:
-    type: failer
-    config:
-      mode: "always"
+      path: /var/log/notrouter/audit.jsonl
 
 groups:
   noc-team:
-    subscribers: [stdout_debug, file_audit, test_failer]
-  test-failure-paths:
-    subscribers: [stdout_debug, test_failer]
+    subscribers: [webex_noc, file_audit]
 
 routing:
   - match: {}

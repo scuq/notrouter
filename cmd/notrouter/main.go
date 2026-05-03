@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/scuq/notrouter/internal/admin"
+	"github.com/scuq/notrouter/internal/admin/creds"
 	"github.com/scuq/notrouter/internal/config"
 	"github.com/scuq/notrouter/internal/dedup"
 	"github.com/scuq/notrouter/internal/dispatch"
@@ -59,6 +60,20 @@ func run(configPath string) error {
 		"commit", version.Commit,
 		"config", configPath,
 		"plugins", plugins.Types())
+
+	// Open creds store before anything else - if the file is unwritable
+	// we want to fail fast at startup, not when the operator first tries
+	// to log in.
+	credStore, err := creds.Open(cfg.Auth.Admin.CredsPath)
+	if err != nil {
+		return fmt.Errorf("open creds store: %w", err)
+	}
+	if credStore.MustChange() {
+		log.Warn("admin password is the seed value - login will force a change",
+			"creds_path", cfg.Auth.Admin.CredsPath)
+	} else {
+		log.Info("admin creds loaded", "updated_at", credStore.UpdatedAt())
+	}
 
 	instances, err := buildInstances(cfg)
 	if err != nil {
@@ -125,15 +140,24 @@ func run(configPath string) error {
 		return fmt.Errorf("start receivers: %w", err)
 	}
 
-	// Wire admin probes from the runtime components. Each component owns
-	// its own state; admin reads it through these interfaces, never holds
-	// any references that would stall shutdown.
 	probes := admin.Probes{
 		Dispatch: dsp,
 		Dedup:    deduper,
 		Tracker:  tracker,
 	}
-	adm := admin.New(cfg.Listen.Admin, cfg.Auth.Admin.Username, cfg.Auth.Admin.Password, probes, log)
+	adm, err := admin.NewWithUI(
+		cfg.Listen.Admin,
+		cfg.Auth.Admin.Username,
+		cfg.Auth.Admin.Password,
+		credStore,
+		cfg.Auth.Admin.SessionTTL,
+		probes,
+		log,
+	)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("build admin: %w", err)
+	}
 	if err := adm.Start(ctx, &ioWg); err != nil {
 		cancel()
 		return fmt.Errorf("start admin: %w", err)

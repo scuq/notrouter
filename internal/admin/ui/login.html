@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>notrouter // login</title>
+  <link rel="stylesheet" href="/admin/ui/static/style.css">
+</head>
+<body class="login-page">
+  <div class="terminal">
+    <div class="terminal-header">
+      <h1>notrouter</h1>
+      <div class="prompt-line">// login required_</div>
+    </div>
+
+    {{ if .Error }}<div class="error">{{ .Error }}</div>{{ end }}
+
+    <form method="POST" action="/admin/api/login">
+      <input type="hidden" name="csrf" value="{{ .CSRF }}">
+
+      <label for="user">username</label>
+      <input type="text" id="user" name="user" autocomplete="username" autofocus required>
+
+      <label for="pass">password</label>
+      <input type="password" id="pass" name="pass" autocomplete="current-password" required>
+
+      <button type="submit" class="full">authenticate</button>
+    </form>
+
+    <div class="footer">
+      <span>v{{ .Version }}</span>
+      <span>{{ .Commit }}</span>
+    </div>
+  </div>
+</body>
+</html>
