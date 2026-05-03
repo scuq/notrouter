@@ -9,3 +9,5 @@ coverage.out
 bootstrap-*.sh
 hotfix*.sh
 cookies.txt
+
+config-backups/
