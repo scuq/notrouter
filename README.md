@@ -9,13 +9,6 @@ Single Go binary. Two external dependencies (`gopkg.in/yaml.v3`,
 `prometheus/client_golang`). Designed to handle 1000 messages/second sustained
 on modest hardware.
 
-## Status
-
-**v0.1.0** — feature-complete for the original brief. End-to-end pipeline
-working, validated at 100 msg/s with sub-millisecond p99. Production use is
-fine for a single team; multi-tenant features (per-team RBAC, persistent
-config UI) are intentionally out of scope.
-
 ## Pipeline
 
 ```
@@ -556,4 +549,4 @@ ceiling is bound by network egress to plugins, not pipeline overhead.
 
 ## License
 
-[your choice]
+None.
