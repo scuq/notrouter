@@ -1,6 +1,7 @@
 *, *::before, *::after { box-sizing: border-box; }
 
 body {
+  font-size: 125%;
   margin: 0;
   min-height: 100dvh;
   background: #000;
@@ -9,7 +10,7 @@ body {
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding: 1rem;
+  padding: 2rem 1rem;
   background-image: repeating-linear-gradient(
     0deg,
     rgba(0, 255, 65, .015) 0px,
@@ -19,9 +20,8 @@ body {
   );
 }
 
-/* layout: login (centered narrow card) vs dashboard (wider) */
 body.login-page { align-items: center; }
-body.app-page .terminal { max-width: 980px; }
+body.app-page .terminal { max-width: 1400px; width: 95%; }
 
 .terminal {
   width: 100%;
@@ -175,7 +175,6 @@ button.danger:hover, .btn.danger:hover {
 }
 .success::before { content: "OK: "; font-weight: 700; }
 
-/* dashboard nav */
 .nav {
   display: flex;
   gap: 1.25rem;
@@ -192,7 +191,6 @@ button.danger:hover, .btn.danger:hover {
   text-shadow: 0 0 6px rgba(0, 255, 65, .5);
 }
 
-/* tables for dashboard data */
 table {
   width: 100%;
   border-collapse: collapse;
@@ -213,7 +211,6 @@ th {
 }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
-/* status pills */
 .pill {
   display: inline-block;
   padding: .1rem .5rem;
@@ -227,7 +224,6 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .pill.fail     { color: #ff0040; border-color: #ff0040; }
 .pill.partial  { color: #ffaa00; border-color: #ffaa00; }
 
-/* metric grid for dashboard */
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -252,7 +248,6 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
   text-shadow: 0 0 6px rgba(0, 255, 65, .4);
 }
 
-/* footer line */
 .footer {
   border-top: 1px solid #003a0f;
   padding-top: .75rem;
@@ -261,4 +256,20 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
   color: #007a1f;
   display: flex;
   justify-content: space-between;
+}
+
+/* config viewer code block */
+.code {
+  background: #000;
+  border: 1px solid #003a0f;
+  color: #00ff41;
+  padding: 1rem 1.25rem;
+  margin: 0 0 1rem 0;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: .82rem;
+  line-height: 1.45;
+  overflow-x: auto;
+  white-space: pre;
+  max-height: 60vh;
+  overflow-y: auto;
 }

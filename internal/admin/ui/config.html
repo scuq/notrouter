@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>notrouter // config</title>
+  <link rel="stylesheet" href="/admin/ui/static/style.css">
+</head>
+<body class="app-page">
+  <div class="terminal">
+    <div class="terminal-header">
+      <h1>notrouter // config</h1>
+      <nav class="nav">
+        <a href="/admin/ui/">overview</a>
+        <a href="/admin/ui/config" class="active">config</a>
+        {{ range $k, $v := .Links }}<a href="{{ $v }}" target="_blank" rel="noopener">{{ $k }}</a>{{ end }}
+        <a href="/admin/ui/change-password">change password</a>
+        <form method="POST" action="/admin/api/logout" style="display:inline; margin:0;">
+          <input type="hidden" name="csrf" value="{{ .CSRF }}">
+          <button type="submit" style="all:unset; cursor:pointer; color:#007a1f; letter-spacing:1.5px; text-transform:uppercase; font-size:.75rem;" onmouseover="this.style.color='#00ff41'" onmouseout="this.style.color='#007a1f'">logout</button>
+        </form>
+      </nav>
+    </div>
+
+    {{ if .DriftError }}
+      <div class="error">cannot read config from disk: {{ .DriftError }}</div>
+    {{ else if .Drifted }}
+      <div class="notice">disk file differs from loaded config - restart to apply</div>
+    {{ else }}
+      <div class="success">disk file matches loaded config</div>
+    {{ end }}
+
+    <h2>source</h2>
+    <table>
+      <tr><th>path</th><td>{{ .ConfigPath }}</td></tr>
+      <tr><th>loaded hash</th><td>{{ .LoadedHash }}</td></tr>
+      <tr><th>disk hash</th><td>{{ if .DiskHash }}{{ .DiskHash }}{{ else }}-{{ end }}</td></tr>
+      <tr><th>disk size</th><td>{{ .DiskSize }} bytes</td></tr>
+    </table>
+
+    <h2>contents</h2>
+    {{ if .ReadError }}
+      <div class="error">{{ .ReadError }}</div>
+    {{ else }}
+      <pre class="code">{{ .Body }}</pre>
+    {{ end }}
+
+    <div class="footer">
+      <span>signed in as {{ .User }}</span>
+      <span>read from disk live; restart to apply changes</span>
+    </div>
+  </div>
+</body>
+</html>

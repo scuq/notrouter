@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"time"
@@ -21,7 +23,22 @@ type Config struct {
 	Routing         []RoutingRuleConfig       `yaml:"routing"`
 	Dispatch        DispatchConfig            `yaml:"dispatch"`
 	Pipeline        PipelineConfig            `yaml:"pipeline"`
+	Links           map[string]string         `yaml:"links"`
+
+	// path and loadedHash are populated by Load(). Not YAML-tagged so they
+	// don't accidentally appear in re-marshaled output.
+	path       string `yaml:"-"`
+	loadedHash string `yaml:"-"`
 }
+
+// Path returns the file the config was loaded from. Used by the admin UI
+// to re-read the file fresh from disk (the planned hot-reload path).
+func (c *Config) Path() string { return c.path }
+
+// LoadedHash is a short fingerprint of the bytes that were loaded. The
+// admin UI compares this to a fresh hash of the disk file to flag drift
+// between what's running and what's on disk.
+func (c *Config) LoadedHash() string { return c.loadedHash }
 
 type ListenConfig struct {
 	Webhook   string `yaml:"webhook"`
@@ -157,7 +174,27 @@ func Load(path string) (*Config, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
+	cfg.path = path
+	cfg.loadedHash = hashBytes(data)
 	return cfg, nil
+}
+
+// hashBytes returns the first 8 bytes of SHA256 hex-encoded. Plenty for
+// drift detection; full hashes are wasteful in HTTP responses.
+func hashBytes(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:8])
+}
+
+// HashFile is a public helper the admin handler uses to fingerprint
+// what's on disk right now, so it can compare to LoadedHash() without
+// opening the config package's internals.
+func HashFile(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return hashBytes(b), nil
 }
 
 func (c *Config) applyDefaults() {

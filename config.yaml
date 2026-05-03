@@ -4,6 +4,11 @@ listen:
   syslog_tcp: ":5514"
   admin: ":9090"
 
+links:
+  grafana: "https://grafana.example.com/d/abc/notrouter"
+  runbook: "https://wiki.example.com/notrouter"
+  github: "https://gitlab.example.com/scuq/notrouter"
+
 auth:
   admin:
     # Username for legacy basic auth on /admin/state, /admin/deliveries,

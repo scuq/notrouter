@@ -59,11 +59,9 @@ func run(configPath string) error {
 		"version", version.Version,
 		"commit", version.Commit,
 		"config", configPath,
+		"loaded_hash", cfg.LoadedHash(),
 		"plugins", plugins.Types())
 
-	// Open creds store before anything else - if the file is unwritable
-	// we want to fail fast at startup, not when the operator first tries
-	// to log in.
 	credStore, err := creds.Open(cfg.Auth.Admin.CredsPath)
 	if err != nil {
 		return fmt.Errorf("open creds store: %w", err)
@@ -153,6 +151,9 @@ func run(configPath string) error {
 		cfg.Auth.Admin.SessionTTL,
 		probes,
 		log,
+		cfg.Path(),
+		cfg.LoadedHash(),
+		cfg.Links,
 	)
 	if err != nil {
 		cancel()

@@ -17,24 +17,32 @@ import (
 const QueueDegradedRatio = 0.9
 
 type Server struct {
-	addr    string
-	user    string
-	pass    string
-	creds   credsAccessor
-	probes  Probes
-	log     *slog.Logger
-	server  *http.Server
-	store   *SessionStore
-	uiH     *uiHandler
+	addr   string
+	user   string
+	pass   string
+	creds  credsAccessor
+	probes Probes
+	log    *slog.Logger
+	server *http.Server
+	store  *SessionStore
+	uiH    *uiHandler
 }
 
-// NewWithUI is the new constructor used in pass 5a. Takes the credentials
-// store and session TTL so the UI can do real auth. The legacy `New(...)`
-// signature is kept as a thin wrapper so older code compiles unchanged
-// during the upgrade.
-func NewWithUI(addr string, basicUser, basicPass string, creds credsAccessor, sessionTTL time.Duration, probes Probes, log *slog.Logger) (*Server, error) {
+// NewWithUI wires the full admin server. configPath + loadedHash + links
+// are passed through to the UI handler so the config-viewer page can do
+// its drift check and render the configurable nav links.
+func NewWithUI(
+	addr string,
+	basicUser, basicPass string,
+	creds credsAccessor,
+	sessionTTL time.Duration,
+	probes Probes,
+	log *slog.Logger,
+	configPath, loadedHash string,
+	links map[string]string,
+) (*Server, error) {
 	store := NewSessionStore(sessionTTL)
-	uiH, err := newUIHandler(store, creds, probes, sessionTTL, log)
+	uiH, err := newUIHandler(store, creds, probes, sessionTTL, log, configPath, loadedHash, links)
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +61,6 @@ func NewWithUI(addr string, basicUser, basicPass string, creds credsAccessor, se
 func (s *Server) Start(ctx context.Context, wg *sync.WaitGroup) error {
 	mux := http.NewServeMux()
 
-	// Public endpoints (no auth).
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
@@ -63,19 +70,14 @@ func (s *Server) Start(ctx context.Context, wg *sync.WaitGroup) error {
 		})
 	})
 
-	// Web UI (session-cookie auth).
 	s.uiH.register(mux)
 
-	// Legacy admin JSON endpoints accept basic auth OR session cookie.
-	// Existing scripts using -u admin:pass keep working; the UI's session
-	// cookie also unlocks them. New code should prefer /admin/api/*.
 	dual := s.dualAuth(http.HandlerFunc(s.handleLegacyMux))
 	mux.Handle("/admin/state", dual)
 	mux.Handle("/admin/deliveries", dual)
 	mux.Handle("/admin/dedup/clear", dual)
 	mux.Handle("/admin/", dual)
 
-	// Bare / behind dual auth, simple banner.
 	mux.Handle("/", s.dualAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("notrouter admin\n"))
 	})))
@@ -107,19 +109,14 @@ func (s *Server) Start(ctx context.Context, wg *sync.WaitGroup) error {
 	return nil
 }
 
-// dualAuth accepts either a valid session cookie or HTTP basic auth.
-// On failure it returns 401 with WWW-Authenticate so curl users get
-// a prompt; UI users will already have a cookie.
 func (s *Server) dualAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Session cookie path.
 		if sid := readSessionCookie(r); sid != "" {
 			if _, _, ok := s.store.Get(sid); ok {
 				next.ServeHTTP(w, r)
 				return
 			}
 		}
-		// Basic auth path.
 		u, p, ok := r.BasicAuth()
 		if ok &&
 			subtle.ConstantTimeCompare([]byte(u), []byte(s.user)) == 1 &&
@@ -132,8 +129,6 @@ func (s *Server) dualAuth(next http.Handler) http.Handler {
 	})
 }
 
-// handleLegacyMux dispatches to the existing handler functions. Using a
-// single-mux pattern keeps the dual-auth wrapper in one place.
 func (s *Server) handleLegacyMux(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/admin/state":

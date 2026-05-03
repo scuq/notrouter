@@ -6,9 +6,11 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/scuq/notrouter/internal/config"
 	"github.com/scuq/notrouter/internal/version"
 )
 
@@ -16,12 +18,21 @@ type uiHandler struct {
 	tmplLogin    *template.Template
 	tmplDash     *template.Template
 	tmplChangePw *template.Template
+	tmplConfig   *template.Template
 	staticFS     http.FileSystem
 	store        *SessionStore
 	creds        credsAccessor
 	probes       Probes
 	ttl          time.Duration
 	log          *slog.Logger
+
+	// Config-viewer state. configPath is what was passed via -config at
+	// startup; loadedHash is the fingerprint of the bytes that produced
+	// the running pipeline. Comparing loadedHash to a fresh disk hash
+	// surfaces drift between what's running and what's on disk.
+	configPath string
+	loadedHash string
+	links      map[string]string
 }
 
 type credsAccessor interface {
@@ -31,7 +42,15 @@ type credsAccessor interface {
 	SetPassword(newPlain string) error
 }
 
-func newUIHandler(store *SessionStore, creds credsAccessor, probes Probes, ttl time.Duration, log *slog.Logger) (*uiHandler, error) {
+func newUIHandler(
+	store *SessionStore,
+	creds credsAccessor,
+	probes Probes,
+	ttl time.Duration,
+	log *slog.Logger,
+	configPath, loadedHash string,
+	links map[string]string,
+) (*uiHandler, error) {
 	loginTpl, err := template.ParseFS(uiFS, "ui/login.html")
 	if err != nil {
 		return nil, err
@@ -44,6 +63,10 @@ func newUIHandler(store *SessionStore, creds credsAccessor, probes Probes, ttl t
 	if err != nil {
 		return nil, err
 	}
+	configTpl, err := template.ParseFS(uiFS, "ui/config.html")
+	if err != nil {
+		return nil, err
+	}
 	staticSub, err := fs.Sub(uiFS, "ui/static")
 	if err != nil {
 		return nil, err
@@ -52,12 +75,16 @@ func newUIHandler(store *SessionStore, creds credsAccessor, probes Probes, ttl t
 		tmplLogin:    loginTpl,
 		tmplDash:     dashTpl,
 		tmplChangePw: cpwTpl,
+		tmplConfig:   configTpl,
 		staticFS:     http.FS(staticSub),
 		store:        store,
 		creds:        creds,
 		probes:       probes,
 		ttl:          ttl,
 		log:          log,
+		configPath:   configPath,
+		loadedHash:   loadedHash,
+		links:        links,
 	}, nil
 }
 
@@ -65,6 +92,7 @@ func (h *uiHandler) register(mux *http.ServeMux) {
 	mux.Handle("/admin/ui/static/", http.StripPrefix("/admin/ui/static/", http.FileServer(h.staticFS)))
 	mux.HandleFunc("/admin/ui/login", h.handleLoginPage)
 	mux.HandleFunc("/admin/ui/change-password", h.requireSession(h.handleChangePasswordPage))
+	mux.HandleFunc("/admin/ui/config", h.requireSession(h.handleConfigPage))
 	mux.HandleFunc("/admin/ui/", h.requireSession(h.handleDashboard))
 	mux.HandleFunc("/admin/ui", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin/ui/", http.StatusFound)
@@ -75,6 +103,7 @@ func (h *uiHandler) register(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/change-password", h.requireSession(h.handleChangePasswordPost))
 	mux.HandleFunc("/admin/api/state", h.requireSession(h.handleAPIState))
 	mux.HandleFunc("/admin/api/deliveries", h.requireSession(h.handleAPIDeliveries))
+	mux.HandleFunc("/admin/api/config", h.requireSession(h.handleAPIConfig))
 }
 
 func (h *uiHandler) requireSession(next http.HandlerFunc) http.HandlerFunc {
@@ -101,10 +130,6 @@ func (h *uiHandler) requireSession(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// writeCSRFCookie syncs the CSRF cookie to a known value. Called on every
-// page render so the cookie always matches what's embedded in the form.
-// Without this, the cookie could hold an older login-page token that
-// doesn't match the session-stored token rendered into the form.
 func (h *uiHandler) writeCSRFCookie(w http.ResponseWriter, r *http.Request, value string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     csrfCookieName,
@@ -144,6 +169,7 @@ func (h *uiHandler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"CSRF":    csrf,
 		"Version": version.Version,
 		"Commit":  version.Commit,
+		"Links":   h.links,
 	})
 }
 
@@ -158,6 +184,51 @@ func (h *uiHandler) handleChangePasswordPage(w http.ResponseWriter, r *http.Requ
 		"Error":      r.URL.Query().Get("err"),
 		"Success":    r.URL.Query().Get("ok"),
 	})
+}
+
+// handleConfigPage reads the live disk file (NOT the in-memory loaded
+// config), shows it to the operator, and surfaces any drift between
+// disk and what's currently running. The pipeline still runs the loaded
+// version - hot reload is a future pass.
+func (h *uiHandler) handleConfigPage(w http.ResponseWriter, r *http.Request) {
+	user := r.Header.Get("X-Notrouter-User")
+	_, csrf, _ := h.store.Get(readSessionCookie(r))
+	h.writeCSRFCookie(w, r, csrf)
+
+	body, readErr := os.ReadFile(h.configPath)
+	var diskHash string
+	var diskSize int64
+	var driftErr string
+	var drifted bool
+
+	if readErr != nil {
+		driftErr = readErr.Error()
+	} else {
+		diskHash, _ = config.HashFile(h.configPath)
+		diskSize = int64(len(body))
+		drifted = diskHash != h.loadedHash
+	}
+
+	data := map[string]interface{}{
+		"User":       user,
+		"CSRF":       csrf,
+		"Version":    version.Version,
+		"Commit":     version.Commit,
+		"Links":      h.links,
+		"ConfigPath": h.configPath,
+		"LoadedHash": h.loadedHash,
+		"DiskHash":   diskHash,
+		"DiskSize":   diskSize,
+		"Drifted":    drifted,
+		"DriftError": driftErr,
+	}
+	if readErr != nil {
+		data["ReadError"] = readErr.Error()
+	} else {
+		data["Body"] = string(body)
+	}
+
+	h.renderTemplate(w, h.tmplConfig, data)
 }
 
 // --- API: login ---
@@ -247,18 +318,16 @@ func (h *uiHandler) handleChangePasswordPost(w http.ResponseWriter, r *http.Requ
 		http.Redirect(w, r, "/admin/ui/change-password?err=new+password+must+differ", http.StatusFound)
 		return
 	}
-
 	if err := h.creds.SetPassword(new1); err != nil {
 		h.log.Error("password change failed", "err", err)
 		http.Redirect(w, r, "/admin/ui/change-password?err="+template.URLQueryEscaper(err.Error()), http.StatusFound)
 		return
 	}
-
 	h.log.Info("password changed", "user", r.Header.Get("X-Notrouter-User"))
 	http.Redirect(w, r, "/admin/ui/change-password?ok=password+updated", http.StatusFound)
 }
 
-// --- API: state + deliveries ---
+// --- API: state + deliveries + config ---
 
 func (h *uiHandler) handleAPIState(w http.ResponseWriter, r *http.Request) {
 	state := map[string]interface{}{
@@ -287,6 +356,29 @@ func (h *uiHandler) handleAPIDeliveries(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"pending": h.probes.Tracker.Pending(),
 		"recent":  h.probes.Tracker.RecentFinal(),
+	})
+}
+
+// handleAPIConfig is the JSON sibling of /admin/ui/config. Returns disk
+// bytes, both hashes, and drift state. Useful for tooling that wants to
+// detect drift programmatically (CI checks, alerting, etc.).
+func (h *uiHandler) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
+	body, err := os.ReadFile(h.configPath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+			"path":  h.configPath,
+			"error": err.Error(),
+		})
+		return
+	}
+	diskHash, _ := config.HashFile(h.configPath)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"path":        h.configPath,
+		"loaded_hash": h.loadedHash,
+		"disk_hash":   diskHash,
+		"size":        len(body),
+		"drifted":     diskHash != h.loadedHash,
+		"body":        string(body),
 	})
 }
 

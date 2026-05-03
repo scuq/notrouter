@@ -12,6 +12,8 @@
       <h1>notrouter // dashboard</h1>
       <nav class="nav">
         <a href="/admin/ui/" class="active">overview</a>
+        <a href="/admin/ui/config">config</a>
+        {{ range $k, $v := .Links }}<a href="{{ $v }}" target="_blank" rel="noopener">{{ $k }}</a>{{ end }}
         <a href="/admin/ui/change-password">change password</a>
         <form method="POST" action="/admin/api/logout" style="display:inline; margin:0;">
           <input type="hidden" name="csrf" value="{{ .CSRF }}">
