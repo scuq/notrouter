@@ -10,7 +10,7 @@ body {
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding: 2rem 1rem;
+  padding: 15px;
   background-image: repeating-linear-gradient(
     0deg,
     rgba(0, 255, 65, .015) 0px,
@@ -21,7 +21,7 @@ body {
 }
 
 body.login-page { align-items: center; }
-body.app-page .terminal { max-width: 1400px; width: 95%; }
+body.app-page .terminal { max-width: none; width: 100%; }
 
 .terminal {
   width: 100%;
