@@ -395,3 +395,88 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
   background: rgba(0, 60, 20, .95);
   box-shadow: 0 0 18px rgba(0, 255, 65, .5);
 }
+/* === config editor === */
+
+.cfg-toolbar {
+  display: flex;
+  gap: .75rem;
+  margin: .5rem 0 .75rem;
+  flex-wrap: wrap;
+}
+
+.cfg-textarea {
+  width: 100%;
+  min-height: 60vh;
+  background: #000;
+  color: #00ff41;
+  border: 1px solid #003a0f;
+  padding: 1rem 1.25rem;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: .82rem;
+  line-height: 1.45;
+  outline: none;
+  resize: vertical;
+  caret-color: #00ff41;
+  margin-bottom: 1rem;
+  /* No tabs are necessary for YAML, but if anyone pastes one render
+     it as 2 spaces wide for readability. */
+  tab-size: 2;
+}
+.cfg-textarea[readonly] {
+  color: #1ea53a;
+  border-color: #003a0f;
+}
+.cfg-textarea:not([readonly]) {
+  border-color: #00ff41;
+  box-shadow: 0 0 12px rgba(0, 255, 65, .15);
+}
+
+.cfg-status {
+  min-height: 1.5em;
+  padding: .35rem .75rem;
+  margin-bottom: .5rem;
+  font-size: .82rem;
+  letter-spacing: .5px;
+}
+.cfg-status:empty { display: none; }
+.cfg-status.ok {
+  color: #00ff41;
+  border: 1px solid #00ff41;
+  background: rgba(0, 255, 65, .08);
+}
+.cfg-status.info {
+  color: #1ea53a;
+  border: 1px solid #1ea53a;
+  background: rgba(30, 165, 58, .08);
+}
+.cfg-status.error {
+  color: #ff0040;
+  border: 1px solid #ff0040;
+  background: rgba(255, 0, 64, .08);
+  text-shadow: 0 0 6px rgba(255, 0, 64, .4);
+}
+
+.cfg-help {
+  border: 1px solid #003a0f;
+  padding: .75rem 1rem;
+  font-size: .8rem;
+  color: #1ea53a;
+  text-shadow: 0 0 3px rgba(30, 165, 58, .25);
+  margin-top: .5rem;
+}
+.cfg-help ol { margin: .25rem 0 .5rem 1.25rem; padding: 0; }
+.cfg-help li { margin: .15rem 0; }
+.cfg-help code {
+  background: rgba(0, 255, 65, .08);
+  padding: 0 .3rem;
+  color: #00ff41;
+}
+
+/* #cfg-drift styling: the surrounding rule re-uses .success/.notice/.error
+   so it just needs base padding. */
+#cfg-drift {
+  padding: .6rem .75rem;
+  font-size: .82rem;
+  margin-bottom: 1rem;
+  letter-spacing: .5px;
+}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
@@ -13,16 +12,9 @@ import (
 	"github.com/scuq/notrouter/internal/admin"
 	"github.com/scuq/notrouter/internal/admin/creds"
 	"github.com/scuq/notrouter/internal/config"
-	"github.com/scuq/notrouter/internal/dedup"
-	"github.com/scuq/notrouter/internal/dispatch"
-	"github.com/scuq/notrouter/internal/event"
 	"github.com/scuq/notrouter/internal/logging"
-	"github.com/scuq/notrouter/internal/parser"
-	"github.com/scuq/notrouter/internal/pipeline"
 	"github.com/scuq/notrouter/internal/plugins"
-	"github.com/scuq/notrouter/internal/receivers"
-	"github.com/scuq/notrouter/internal/router"
-	"github.com/scuq/notrouter/internal/suppress"
+	"github.com/scuq/notrouter/internal/runtime"
 	"github.com/scuq/notrouter/internal/version"
 
 	_ "github.com/scuq/notrouter/internal/plugins/failer"
@@ -54,8 +46,6 @@ func run(configPath string) error {
 		return err
 	}
 
-	// logging.New now also returns the in-memory ring buffer; the admin UI
-	// reads from it via /admin/api/logs.
 	log, logBuf := logging.New(cfg.Logging.Level)
 	log.Info("notrouter starting",
 		"version", version.Version,
@@ -75,95 +65,46 @@ func run(configPath string) error {
 		log.Info("admin creds loaded", "updated_at", credStore.UpdatedAt())
 	}
 
-	instances, err := buildInstances(cfg)
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+
+	// Initial pipeline. Build+Start as one unit so a port conflict at
+	// startup fails the binary immediately, like it always has.
+	initial, err := runtime.Build(cfg, log)
 	if err != nil {
-		return fmt.Errorf("build plugin instances: %w", err)
+		return fmt.Errorf("build initial pipeline: %w", err)
 	}
-	defer closeInstances(instances, log)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	pl := pipeline.New(
-		cfg.Pipeline.RawBufferSize,
-		cfg.Pipeline.NormalBufferSize,
-		cfg.Pipeline.RawBufferSize,
-	)
-
-	resolvedCh := make(chan *pipeline.RawEvent, cfg.Pipeline.NormalBufferSize)
-	dedupedCh := make(chan *event.Event, cfg.Pipeline.NormalBufferSize)
-	suppressedCh := make(chan *event.Event, cfg.Pipeline.NormalBufferSize)
-
-	resolver, err := parser.NewEntityResolver(pl.RawCh, resolvedCh, cfg.Profiles, cfg.Pipeline.ResolverWorkers, log)
-	if err != nil {
-		return fmt.Errorf("build entity resolver: %w", err)
-	}
-	normalizer, err := parser.NewNormalizer(resolvedCh, pl.NormalCh, cfg.Profiles, cfg.Pipeline.NormalizerWorkers, log)
-	if err != nil {
-		return fmt.Errorf("build normalizer: %w", err)
-	}
-	deduper := dedup.New(pl.NormalCh, dedupedCh, cfg.Dedup.TTL, cfg.Dedup.KeyFields, log)
-	suppr, err := suppress.New(dedupedCh, suppressedCh, cfg.Suppressors, cfg.Logging.SuppressorLogThrottle, log)
-	if err != nil {
-		return fmt.Errorf("build suppressor: %w", err)
-	}
-	rtr, err := router.New(suppressedCh, pl.DispatchCh, cfg.Routing, cfg.Groups, log)
-	if err != nil {
-		return fmt.Errorf("build router: %w", err)
+	if err := initial.Start(parentCtx); err != nil {
+		return fmt.Errorf("start initial pipeline: %w", err)
 	}
 
-	tracker := dispatch.NewTracker(cfg.Dispatch.GlobalDeliveryTTL, log)
-	dsp := dispatch.NewDispatcher(
-		pl.DispatchCh,
-		tracker,
-		instances,
-		cfg.Dispatch.DefaultRetry,
-		cfg.PluginInstances,
-		cfg.Pipeline.InstanceBufferSize,
-		log,
-	)
+	// Reloader manages all subsequent pipeline lifecycle. The admin
+	// server holds a reference and uses it for both probes (which point
+	// at the live pipeline) and for triggering reloads.
+	reloader := runtime.NewReloader(parentCtx, log, initial)
 
-	pl.AddStage(resolver)
-	pl.AddStage(normalizer)
-	pl.AddStage(deduper)
-	pl.AddStage(suppr)
-	pl.AddStage(rtr)
-	pl.AddStage(dsp)
-	pl.AddStage(tracker)
-
-	pl.Start(ctx)
-
-	var ioWg sync.WaitGroup
-
-	if err := startReceivers(ctx, &ioWg, cfg, pl.RawCh, log); err != nil {
-		cancel()
-		return fmt.Errorf("start receivers: %w", err)
-	}
-
-	probes := admin.Probes{
-		Dispatch: dsp,
-		Dedup:    deduper,
-		Tracker:  tracker,
-	}
 	adm, err := admin.NewWithUI(
 		cfg.Listen.Admin,
 		cfg.Auth.Admin.Username,
 		cfg.Auth.Admin.Password,
 		credStore,
 		cfg.Auth.Admin.SessionTTL,
-		probes,
 		log,
-		cfg.Path(),
-		cfg.LoadedHash(),
-		cfg.Links,
+		reloader,
+		cfg.Auth.Admin.CredsPath,
 		logBuf,
 	)
 	if err != nil {
-		cancel()
+		initial.Stop()
 		return fmt.Errorf("build admin: %w", err)
 	}
-	if err := adm.Start(ctx, &ioWg); err != nil {
-		cancel()
+
+	// Admin server has its own goroutine accounting because it must
+	// survive across pipeline reloads. Use a separate WaitGroup, not
+	// the pipeline's.
+	var adminWg sync.WaitGroup
+	if err := adm.Start(parentCtx, &adminWg); err != nil {
+		initial.Stop()
 		return fmt.Errorf("start admin: %w", err)
 	}
 
@@ -172,51 +113,12 @@ func run(configPath string) error {
 	s := <-sig
 	log.Info("shutdown signal received", "signal", s.String())
 
-	cancel()
-	ioWg.Wait()
-	close(pl.RawCh)
-	pl.Wait()
+	// Shut down: cancel root context (cascades to admin), stop the
+	// currently-running pipeline.
+	cancelParent()
+	adminWg.Wait()
+	reloader.Current().Stop()
 
 	log.Info("shutdown complete")
-	return nil
-}
-
-func buildInstances(cfg *config.Config) (map[string]plugins.Instance, error) {
-	out := make(map[string]plugins.Instance, len(cfg.PluginInstances))
-	for name, ic := range cfg.PluginInstances {
-		p, ok := plugins.Get(ic.Type)
-		if !ok {
-			return nil, fmt.Errorf("plugin instance %q: unknown type %q", name, ic.Type)
-		}
-		inst, err := p.New(name, ic.Config)
-		if err != nil {
-			return nil, fmt.Errorf("plugin instance %q: %w", name, err)
-		}
-		out[name] = inst
-	}
-	return out, nil
-}
-
-func closeInstances(instances map[string]plugins.Instance, log *slog.Logger) {
-	for name, inst := range instances {
-		if err := inst.Close(); err != nil {
-			log.Error("close plugin instance", "name", name, "err", err)
-		}
-	}
-}
-
-func startReceivers(ctx context.Context, wg *sync.WaitGroup, cfg *config.Config, rawCh chan<- *pipeline.RawEvent, log *slog.Logger) error {
-	wh := receivers.NewWebhook(cfg.Listen.Webhook, cfg.Receivers.Webhook.Endpoints, rawCh, log)
-	if err := wh.Start(ctx, wg); err != nil {
-		return fmt.Errorf("webhook: %w", err)
-	}
-	udp := receivers.NewSyslogUDP(cfg.Listen.SyslogUDP, rawCh, log)
-	if err := udp.Start(ctx, wg); err != nil {
-		return fmt.Errorf("syslog-udp: %w", err)
-	}
-	tcp := receivers.NewSyslogTCP(cfg.Listen.SyslogTCP, rawCh, log)
-	if err := tcp.Start(ctx, wg); err != nil {
-		return fmt.Errorf("syslog-tcp: %w", err)
-	}
 	return nil
 }

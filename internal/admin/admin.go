@@ -22,38 +22,42 @@ type Server struct {
 	user   string
 	pass   string
 	creds  credsAccessor
-	probes Probes
 	log    *slog.Logger
 	server *http.Server
 	store  *SessionStore
 	uiH    *uiHandler
+
+	rtMu sync.RWMutex
+	rt   reloaderAccessor
 }
 
+// NewWithUI wires the admin server with all UI dependencies including
+// the reloader. The admin server is reload-immune - it never gets torn
+// down by a reload.
 func NewWithUI(
 	addr string,
 	basicUser, basicPass string,
 	creds credsAccessor,
 	sessionTTL time.Duration,
-	probes Probes,
 	log *slog.Logger,
-	configPath, loadedHash string,
-	links map[string]string,
+	rt reloaderAccessor,
+	credsPath string,
 	logs *logbuffer.Buffer,
 ) (*Server, error) {
 	store := NewSessionStore(sessionTTL)
-	uiH, err := newUIHandler(store, creds, probes, sessionTTL, log, configPath, loadedHash, links, logs)
+	uiH, err := newUIHandler(store, creds, sessionTTL, log, rt, credsPath, logs)
 	if err != nil {
 		return nil, err
 	}
 	return &Server{
-		addr:   addr,
-		user:   basicUser,
-		pass:   basicPass,
-		creds:  creds,
-		probes: probes,
-		log:    log,
-		store:  store,
-		uiH:    uiH,
+		addr:  addr,
+		user:  basicUser,
+		pass:  basicPass,
+		creds: creds,
+		log:   log,
+		store: store,
+		uiH:   uiH,
+		rt:    rt,
 	}, nil
 }
 
@@ -108,6 +112,12 @@ func (s *Server) Start(ctx context.Context, wg *sync.WaitGroup) error {
 	return nil
 }
 
+func (s *Server) currentProbes() Probes {
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	return s.rt.Probes()
+}
+
 func (s *Server) dualAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if sid := readSessionCookie(r); sid != "" {
@@ -151,8 +161,10 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	var degraded []string
 	var queues []queueReport
 
-	if s.probes.Dispatch != nil {
-		for _, q := range s.probes.Dispatch.QueueState() {
+	probes := s.currentProbes()
+
+	if probes.Dispatch != nil {
+		for _, q := range probes.Dispatch.QueueState() {
 			pct := 0.0
 			if q.Capacity > 0 {
 				pct = float64(q.Depth) / float64(q.Capacity)
@@ -165,16 +177,16 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pending := 0
-	if s.probes.Tracker != nil {
-		pending = s.probes.Tracker.Pending()
+	if probes.Tracker != nil {
+		pending = probes.Tracker.Pending()
 		if pending > 10000 {
 			degraded = append(degraded, "tracker_pending_high")
 		}
 	}
 
 	dedupSize := 0
-	if s.probes.Dedup != nil {
-		dedupSize = s.probes.Dedup.Size()
+	if probes.Dedup != nil {
+		dedupSize = probes.Dedup.Size()
 		if dedupSize > 1000000 {
 			degraded = append(degraded, "dedup_size_high")
 		}
@@ -197,32 +209,34 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
+	probes := s.currentProbes()
 	state := map[string]interface{}{
 		"version": map[string]string{
 			"version": version.Version,
 			"commit":  version.Commit,
 		},
 	}
-	if s.probes.Dispatch != nil {
-		state["queues"] = s.probes.Dispatch.QueueState()
+	if probes.Dispatch != nil {
+		state["queues"] = probes.Dispatch.QueueState()
 	}
-	if s.probes.Dedup != nil {
-		state["dedup_size"] = s.probes.Dedup.Size()
+	if probes.Dedup != nil {
+		state["dedup_size"] = probes.Dedup.Size()
 	}
-	if s.probes.Tracker != nil {
-		state["tracker_pending"] = s.probes.Tracker.Pending()
+	if probes.Tracker != nil {
+		state["tracker_pending"] = probes.Tracker.Pending()
 	}
 	writeJSON(w, http.StatusOK, state)
 }
 
 func (s *Server) handleDeliveries(w http.ResponseWriter, r *http.Request) {
-	if s.probes.Tracker == nil {
+	probes := s.currentProbes()
+	if probes.Tracker == nil {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"recent": []interface{}{}})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"pending": s.probes.Tracker.Pending(),
-		"recent":  s.probes.Tracker.RecentFinal(),
+		"pending": probes.Tracker.Pending(),
+		"recent":  probes.Tracker.RecentFinal(),
 	})
 }
 
@@ -231,12 +245,13 @@ func (s *Server) handleDedupClear(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.probes.Dedup == nil {
+	probes := s.currentProbes()
+	if probes.Dedup == nil {
 		http.Error(w, "dedup not available", http.StatusServiceUnavailable)
 		return
 	}
-	before := s.probes.Dedup.Size()
-	s.probes.Dedup.Clear()
+	before := probes.Dedup.Size()
+	probes.Dedup.Clear()
 	s.log.Warn("dedup cleared via admin endpoint", "previous_size", before)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"cleared":       true,

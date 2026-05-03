@@ -23,19 +23,21 @@
       </nav>
     </div>
 
-    {{ if .DriftError }}
-      <div class="error">cannot read config from disk: {{ .DriftError }}</div>
-    {{ else if .Drifted }}
-      <div class="notice">disk file differs from loaded config - restart to apply</div>
-    {{ else }}
-      <div class="success">disk file matches loaded config</div>
-    {{ end }}
+    <div id="cfg-drift">
+      {{ if .DriftError }}
+        cannot read config from disk: {{ .DriftError }}
+      {{ else if .Drifted }}
+        disk file differs from loaded config - reload to apply
+      {{ else }}
+        disk file matches loaded config
+      {{ end }}
+    </div>
 
     <h2>source</h2>
     <table>
       <tr><th>path</th><td>{{ .ConfigPath }}</td></tr>
-      <tr><th>loaded hash</th><td>{{ .LoadedHash }}</td></tr>
-      <tr><th>disk hash</th><td>{{ if .DiskHash }}{{ .DiskHash }}{{ else }}-{{ end }}</td></tr>
+      <tr><th>loaded hash</th><td><span id="cfg-loaded-hash">{{ .LoadedHash }}</span></td></tr>
+      <tr><th>disk hash</th><td><span id="cfg-disk-hash">{{ if .DiskHash }}{{ .DiskHash }}{{ else }}-{{ end }}</span></td></tr>
       <tr><th>disk size</th><td>{{ .DiskSize }} bytes</td></tr>
     </table>
 
@@ -43,13 +45,46 @@
     {{ if .ReadError }}
       <div class="error">{{ .ReadError }}</div>
     {{ else }}
-      <pre class="code">{{ .Body }}</pre>
+
+      <div class="cfg-toolbar">
+        <button type="button" id="cfg-edit-toggle" class="inline-btn">edit</button>
+        <button type="button" id="cfg-validate" class="inline-btn" disabled>validate</button>
+        <button type="button" id="cfg-save" class="inline-btn" disabled>save</button>
+        <button type="button" id="cfg-reload" class="inline-btn danger">reload</button>
+      </div>
+
+      <div id="cfg-status" class="cfg-status"></div>
+
+      <textarea id="cfg-body" class="cfg-textarea" spellcheck="false" readonly>{{ .Body }}</textarea>
+
+      <div class="cfg-help">
+        <strong>workflow:</strong>
+        <ol>
+          <li><b>edit</b> - unlock the textarea</li>
+          <li><b>validate</b> - syntax + cross-reference check (no side effects)</li>
+          <li><b>save</b> - atomic write to disk + rotated backup; <em>does not apply yet</em></li>
+          <li><b>reload</b> - tear down running pipeline and rebuild from disk; ~100ms outage</li>
+        </ol>
+        <p>
+          <b>last-known-good fallback:</b> if reload fails, the previous config is
+          automatically restored. If the rollback also fails, the container will need
+          to be restarted.
+        </p>
+        <p>
+          <b>note:</b> <code>auth.admin.password</code> in the YAML is the legacy basic-auth
+          password. The web UI password lives in
+          <code>{{ .CredsPath }}</code> and is changed via the change-password page.
+        </p>
+      </div>
+
     {{ end }}
 
     <div class="footer">
       <span>signed in as {{ .User }}</span>
-      <span>read from disk live; restart to apply changes</span>
+      <span>edits saved here apply only after reload</span>
     </div>
   </div>
+
+  <script src="/admin/ui/static/config.js"></script>
 </body>
 </html>

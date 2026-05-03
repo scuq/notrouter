@@ -2,13 +2,17 @@ package admin
 
 import (
 	"crypto/subtle"
+	"encoding/json"
+	"errors"
 	"html/template"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/scuq/notrouter/internal/config"
@@ -25,14 +29,37 @@ type uiHandler struct {
 	staticFS     http.FileSystem
 	store        *SessionStore
 	creds        credsAccessor
-	probes       Probes
 	ttl          time.Duration
 	log          *slog.Logger
+	logs         *logbuffer.Buffer
 
-	configPath string
-	loadedHash string
-	links      map[string]string
-	logs       *logbuffer.Buffer
+	// rt holds the live reloader. Probes() and CurrentConfig() come from
+	// the currently-running pipeline. Always go through these methods so
+	// post-reload references update automatically.
+	rtMu sync.RWMutex
+	rt   reloaderAccessor
+
+	credsPath string
+}
+
+// reloaderAccessor decouples admin from the runtime package - we don't
+// import runtime here, runtime imports admin (for Probes type). This
+// avoids the import cycle while letting us call into the reloader.
+type reloaderAccessor interface {
+	CurrentConfig() *config.Config
+	LKGConfig() *config.Config
+	Apply(newCfg *config.Config) ReloadResult
+	Probes() Probes
+}
+
+// ReloadResult mirrors runtime.ReloadResult so we can return it as JSON
+// without importing runtime. The runtime package wraps this.
+type ReloadResult struct {
+	OK              bool   `json:"ok"`
+	AppliedHash     string `json:"applied_hash,omitempty"`
+	Error           string `json:"error,omitempty"`
+	RestoredFromLKG bool   `json:"restored_from_lkg,omitempty"`
+	LKGHash         string `json:"lkg_hash,omitempty"`
 }
 
 type credsAccessor interface {
@@ -45,11 +72,10 @@ type credsAccessor interface {
 func newUIHandler(
 	store *SessionStore,
 	creds credsAccessor,
-	probes Probes,
 	ttl time.Duration,
 	log *slog.Logger,
-	configPath, loadedHash string,
-	links map[string]string,
+	rt reloaderAccessor,
+	credsPath string,
 	logs *logbuffer.Buffer,
 ) (*uiHandler, error) {
 	loginTpl, err := template.ParseFS(uiFS, "ui/login.html")
@@ -85,12 +111,10 @@ func newUIHandler(
 		staticFS:     http.FS(staticSub),
 		store:        store,
 		creds:        creds,
-		probes:       probes,
 		ttl:          ttl,
 		log:          log,
-		configPath:   configPath,
-		loadedHash:   loadedHash,
-		links:        links,
+		rt:           rt,
+		credsPath:    credsPath,
 		logs:         logs,
 	}, nil
 }
@@ -113,6 +137,11 @@ func (h *uiHandler) register(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/deliveries", h.requireSession(h.handleAPIDeliveries))
 	mux.HandleFunc("/admin/api/config", h.requireSession(h.handleAPIConfig))
 	mux.HandleFunc("/admin/api/logs", h.requireSession(h.handleAPILogs))
+
+	// Editor endpoints. All POST, all CSRF-protected.
+	mux.HandleFunc("/admin/api/config/validate", h.requireSession(h.handleAPIConfigValidate))
+	mux.HandleFunc("/admin/api/config/save", h.requireSession(h.handleAPIConfigSave))
+	mux.HandleFunc("/admin/api/config/reload", h.requireSession(h.handleAPIConfigReload))
 }
 
 func (h *uiHandler) requireSession(next http.HandlerFunc) http.HandlerFunc {
@@ -140,14 +169,33 @@ func (h *uiHandler) requireSession(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *uiHandler) writeCSRFCookie(w http.ResponseWriter, r *http.Request, value string) {
+	// CSRF cookie is intentionally readable from JavaScript (no HttpOnly).
+	// The double-submit-cookie pattern relies on the JS being able to read
+	// the cookie and put it in a request header; the security comes from
+	// the same-origin policy preventing other origins from reading it.
+	// The session cookie still uses HttpOnly - that's the one whose
+	// secrecy matters.
 	http.SetCookie(w, &http.Cookie{
 		Name:     csrfCookieName,
 		Value:    value,
 		Path:     "/admin/",
-		HttpOnly: true,
 		Secure:   isHTTPS(r),
 		SameSite: http.SameSiteStrictMode,
 	})
+}
+
+// --- helpers for current state from reloader ---
+
+func (h *uiHandler) currentCfg() *config.Config {
+	h.rtMu.RLock()
+	defer h.rtMu.RUnlock()
+	return h.rt.CurrentConfig()
+}
+
+func (h *uiHandler) currentProbes() Probes {
+	h.rtMu.RLock()
+	defer h.rtMu.RUnlock()
+	return h.rt.Probes()
 }
 
 // --- pages ---
@@ -178,7 +226,7 @@ func (h *uiHandler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"CSRF":    csrf,
 		"Version": version.Version,
 		"Commit":  version.Commit,
-		"Links":   h.links,
+		"Links":   h.currentCfg().Links,
 	})
 }
 
@@ -200,7 +248,11 @@ func (h *uiHandler) handleConfigPage(w http.ResponseWriter, r *http.Request) {
 	_, csrf, _ := h.store.Get(readSessionCookie(r))
 	h.writeCSRFCookie(w, r, csrf)
 
-	body, readErr := os.ReadFile(h.configPath)
+	cfg := h.currentCfg()
+	configPath := cfg.Path()
+	loadedHash := cfg.LoadedHash()
+
+	body, readErr := os.ReadFile(configPath)
 	var diskHash string
 	var diskSize int64
 	var driftErr string
@@ -209,9 +261,9 @@ func (h *uiHandler) handleConfigPage(w http.ResponseWriter, r *http.Request) {
 	if readErr != nil {
 		driftErr = readErr.Error()
 	} else {
-		diskHash, _ = config.HashFile(h.configPath)
+		diskHash, _ = config.HashFile(configPath)
 		diskSize = int64(len(body))
-		drifted = diskHash != h.loadedHash
+		drifted = diskHash != loadedHash
 	}
 
 	data := map[string]interface{}{
@@ -219,13 +271,14 @@ func (h *uiHandler) handleConfigPage(w http.ResponseWriter, r *http.Request) {
 		"CSRF":       csrf,
 		"Version":    version.Version,
 		"Commit":     version.Commit,
-		"Links":      h.links,
-		"ConfigPath": h.configPath,
-		"LoadedHash": h.loadedHash,
+		"Links":      h.currentCfg().Links,
+		"ConfigPath": configPath,
+		"LoadedHash": loadedHash,
 		"DiskHash":   diskHash,
 		"DiskSize":   diskSize,
 		"Drifted":    drifted,
 		"DriftError": driftErr,
+		"CredsPath":  h.credsPath,
 	}
 	if readErr != nil {
 		data["ReadError"] = readErr.Error()
@@ -244,7 +297,7 @@ func (h *uiHandler) handleLogsPage(w http.ResponseWriter, r *http.Request) {
 		"CSRF":    csrf,
 		"Version": version.Version,
 		"Commit":  version.Commit,
-		"Links":   h.links,
+		"Links":   h.currentCfg().Links,
 	})
 }
 
@@ -344,62 +397,62 @@ func (h *uiHandler) handleChangePasswordPost(w http.ResponseWriter, r *http.Requ
 	http.Redirect(w, r, "/admin/ui/change-password?ok=password+updated", http.StatusFound)
 }
 
-// --- API: state, deliveries, config, logs ---
+// --- API: state, deliveries, config (GET), logs ---
 
 func (h *uiHandler) handleAPIState(w http.ResponseWriter, r *http.Request) {
+	probes := h.currentProbes()
 	state := map[string]interface{}{
 		"version": map[string]string{
 			"version": version.Version,
 			"commit":  version.Commit,
 		},
 	}
-	if h.probes.Dispatch != nil {
-		state["queues"] = h.probes.Dispatch.QueueState()
+	if probes.Dispatch != nil {
+		state["queues"] = probes.Dispatch.QueueState()
 	}
-	if h.probes.Dedup != nil {
-		state["dedup_size"] = h.probes.Dedup.Size()
+	if probes.Dedup != nil {
+		state["dedup_size"] = probes.Dedup.Size()
 	}
-	if h.probes.Tracker != nil {
-		state["tracker_pending"] = h.probes.Tracker.Pending()
+	if probes.Tracker != nil {
+		state["tracker_pending"] = probes.Tracker.Pending()
 	}
 	writeJSON(w, http.StatusOK, state)
 }
 
 func (h *uiHandler) handleAPIDeliveries(w http.ResponseWriter, r *http.Request) {
-	if h.probes.Tracker == nil {
+	probes := h.currentProbes()
+	if probes.Tracker == nil {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"recent": []interface{}{}})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"pending": h.probes.Tracker.Pending(),
-		"recent":  h.probes.Tracker.RecentFinal(),
+		"pending": probes.Tracker.Pending(),
+		"recent":  probes.Tracker.RecentFinal(),
 	})
 }
 
 func (h *uiHandler) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
-	body, err := os.ReadFile(h.configPath)
+	cfg := h.currentCfg()
+	configPath := cfg.Path()
+	body, err := os.ReadFile(configPath)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
-			"path":  h.configPath,
+			"path":  configPath,
 			"error": err.Error(),
 		})
 		return
 	}
-	diskHash, _ := config.HashFile(h.configPath)
+	diskHash, _ := config.HashFile(configPath)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"path":        h.configPath,
-		"loaded_hash": h.loadedHash,
+		"path":        configPath,
+		"loaded_hash": cfg.LoadedHash(),
 		"disk_hash":   diskHash,
 		"size":        len(body),
-		"drifted":     diskHash != h.loadedHash,
+		"drifted":     diskHash != cfg.LoadedHash(),
 		"body":        string(body),
 	})
 }
 
-// handleAPILogs returns ring-buffer entries newer than the ?since= param,
-// optionally filtered by minimum level and a substring search. Designed
-// for incremental polling - the UI tracks the highest seq it has and
-// only fetches what's new each tick.
 func (h *uiHandler) handleAPILogs(w http.ResponseWriter, r *http.Request) {
 	since := uint64(0)
 	if s := r.URL.Query().Get("since"); s != "" {
@@ -416,8 +469,153 @@ func (h *uiHandler) handleAPILogs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// --- API: editor (validate / save / reload) ---
+
+// editRequest is the JSON body shape the editor JS posts. Body is the
+// proposed YAML; ExpectedDiskHash supports optimistic concurrency.
+type editRequest struct {
+	Body             string `json:"body"`
+	ExpectedDiskHash string `json:"expected_disk_hash"`
+}
+
+// handleAPIConfigValidate parses+validates without touching disk or pipeline.
+// Returns {ok:true} or {ok:false, error:"..."}.
+func (h *uiHandler) handleAPIConfigValidate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.checkCSRFHeader(r); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{"error": "invalid csrf"})
+		return
+	}
+	req, err := readEditRequest(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	if err := config.ValidateBytes([]byte(req.Body)); err != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"ok":    false,
+			"error": err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
+}
+
+// handleAPIConfigSave writes the new YAML to disk atomically with a
+// timestamped backup. Does NOT apply to the running pipeline. Returns
+// 409 if disk hash changed since the user started editing.
+func (h *uiHandler) handleAPIConfigSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.checkCSRFHeader(r); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{"error": "invalid csrf"})
+		return
+	}
+	req, err := readEditRequest(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	configPath := h.currentCfg().Path()
+	res, err := config.Save(configPath, []byte(req.Body), req.ExpectedDiskHash)
+	if err != nil {
+		var conflict *config.ConflictError
+		if errors.As(err, &conflict) {
+			writeJSON(w, http.StatusConflict, map[string]interface{}{
+				"error":    conflict.Error(),
+				"expected": conflict.Expected,
+				"actual":   conflict.Actual,
+			})
+			return
+		}
+		h.log.Error("config save failed", "err", err)
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	user := r.Header.Get("X-Notrouter-User")
+	h.log.Info("config saved",
+		"user", user,
+		"new_hash", res.NewHash,
+		"backup", res.BackupFile)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":          true,
+		"new_hash":    res.NewHash,
+		"backup_file": res.BackupFile,
+		"backups":     res.Backups,
+	})
+}
+
+// handleAPIConfigReload re-reads the disk file and tells the reloader to
+// rebuild the pipeline. The reloader handles LKG fallback internally;
+// we just translate the result into JSON.
+func (h *uiHandler) handleAPIConfigReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.checkCSRFHeader(r); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{"error": "invalid csrf"})
+		return
+	}
+	configPath := h.currentCfg().Path()
+	body, err := os.ReadFile(configPath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+			"ok":    false,
+			"error": "read config: " + err.Error(),
+		})
+		return
+	}
+	newCfg, err := config.LoadFromBytes(body, configPath)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"ok":    false,
+			"error": "load: " + err.Error(),
+		})
+		return
+	}
+
+	user := r.Header.Get("X-Notrouter-User")
+	h.log.Info("reload requested",
+		"user", user,
+		"new_hash", newCfg.LoadedHash(),
+		"current_hash", h.currentCfg().LoadedHash())
+
+	res := h.rt.Apply(newCfg)
+	out := ReloadResult{
+		OK:              res.OK,
+		AppliedHash:     res.AppliedHash,
+		Error:           res.Error,
+		RestoredFromLKG: res.RestoredFromLKG,
+		LKGHash:         res.LKGHash,
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// readEditRequest parses the JSON body and sanity-checks size. Hard
+// cap at 1 MB so a user can't OOM us with a giant paste.
+func readEditRequest(r *http.Request) (*editRequest, error) {
+	r.Body = http.MaxBytesReader(nil, r.Body, 1<<20)
+	defer r.Body.Close()
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	req := &editRequest{}
+	if err := json.Unmarshal(b, req); err != nil {
+		return nil, err
+	}
+	return req, nil
+}
+
 // --- helpers ---
 
+// checkCSRF used by the legacy form-encoded handlers.
 func (h *uiHandler) checkCSRF(r *http.Request) error {
 	cookie, err := r.Cookie(csrfCookieName)
 	if err != nil {
@@ -432,6 +630,23 @@ func (h *uiHandler) checkCSRF(r *http.Request) error {
 		return ErrUnauthorized
 	}
 	if subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(form)) != 1 {
+		return ErrUnauthorized
+	}
+	return nil
+}
+
+// checkCSRFHeader handles the JSON-body editor calls. The JS sends the
+// CSRF token via X-CSRF-Token header (form bodies aren't being parsed).
+func (h *uiHandler) checkCSRFHeader(r *http.Request) error {
+	cookie, err := r.Cookie(csrfCookieName)
+	if err != nil {
+		return ErrUnauthorized
+	}
+	hdr := r.Header.Get("X-CSRF-Token")
+	if cookie.Value == "" || hdr == "" {
+		return ErrUnauthorized
+	}
+	if subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(hdr)) != 1 {
 		return ErrUnauthorized
 	}
 	return nil

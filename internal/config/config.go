@@ -7,6 +7,8 @@ import (
 	"os"
 	"time"
 
+	"strings"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -176,6 +178,7 @@ func Load(path string) (*Config, error) {
 	}
 	cfg.path = path
 	cfg.loadedHash = hashBytes(data)
+	cfg.Links = filterLinks(cfg.Links)
 	return cfg, nil
 }
 
@@ -286,3 +289,32 @@ func (c *Config) validate() error {
 	}
 	return nil
 }
+
+// filterLinks drops entries whose values are empty, whitespace-only, or
+// one of the string sentinels ("false", "none", "off", "no") - case-
+// insensitive. The point is to let operators hide a link from the nav
+// without deleting the YAML key, e.g. when a config-management tool
+// owns the structure but the operator wants to disable an entry.
+//
+// Bare YAML false would also be nice, but the Links field is
+// map[string]string so unquoted booleans error at parse time. Quoting
+// the value covers the use case.
+func filterLinks(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			continue
+		}
+		switch strings.ToLower(trimmed) {
+		case "false", "no", "off", "none", "null", "nil", "disabled":
+			continue
+		}
+		out[k] = trimmed
+	}
+	return out
+}
+

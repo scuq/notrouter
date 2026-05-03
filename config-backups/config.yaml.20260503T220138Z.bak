@@ -6,8 +6,8 @@ listen:
 
 links:
   grafana: "https://grafana.example.com/d/abc/notrouter"
-  runbook: ""
-  github: ""
+  runbook: "https://wiki.example.com/notrouter2"
+  github: "https://gitlab.example.com/scuq/notrouter"
 
 auth:
   admin:
