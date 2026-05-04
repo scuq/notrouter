@@ -78,6 +78,7 @@ type AdminAuth struct {
 
 type ReceiversConfig struct {
 	Webhook WebhookReceiverConfig `yaml:"webhook"`
+	Syslog  SyslogReceiverConfig  `yaml:"syslog"`
 }
 
 type WebhookReceiverConfig struct {
@@ -93,6 +94,29 @@ type WebhookReceiverConfig struct {
 type WebhookEndpoint struct {
 	Path    string `yaml:"path"`
 	Profile string `yaml:"profile"`
+}
+
+// SyslogReceiverConfig holds settings for the UDP and TCP syslog receivers.
+// Currently the only configurable behavior is the early-drop filter; the
+// listen addresses themselves still come from listen.syslog_udp/tcp at the
+// top level (kept there for backwards compat with v0.1.x configs).
+type SyslogReceiverConfig struct {
+	EarlyFilter SyslogEarlyFilterConfig `yaml:"early_filter"`
+}
+
+// SyslogEarlyFilterConfig is a substring whitelist applied to raw syslog
+// frames before any parsing or pipeline allocation. Designed for high-
+// volume ingestion where the operator only cares about a small set of
+// messages (e.g. firewall syslog at 50k msg/s where 99% is uninteresting).
+//
+// Disabled by default (Enabled: false). When enabled with no patterns,
+// the filter disables itself with a startup warning - the alternative
+// (drop everything) would silently eat all traffic on a config typo.
+type SyslogEarlyFilterConfig struct {
+	Enabled         bool          `yaml:"enabled"`
+	CaseInsensitive bool          `yaml:"case_insensitive"`
+	LogInterval     time.Duration `yaml:"log_interval"`
+	IncludePatterns []string      `yaml:"include_patterns"`
 }
 
 type ProfileConfig struct {

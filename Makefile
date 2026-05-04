@@ -125,15 +125,15 @@ loadtest-light: ## gentle 100 msg/s for 10s
 
 .PHONY: admin-state
 admin-state: ## fetch /admin/state (basic auth required)
-	curl -sS -u admin:admin http://localhost:9090/admin/state | python3 -m json.tool
+	curl -sS -u admin:adminadmin http://localhost:9090/admin/state | python3 -m json.tool
 
 .PHONY: admin-deliveries
 admin-deliveries: ## fetch recent deliveries
-	curl -sS -u admin:admin http://localhost:9090/admin/deliveries | python3 -m json.tool
+	curl -sS -u admin:adminadmin http://localhost:9090/admin/deliveries | python3 -m json.tool
 
 .PHONY: admin-dedup-clear
 admin-dedup-clear: ## panic-button: clear the dedup map
-	curl -sS -X POST -u admin:admin http://localhost:9090/admin/dedup/clear
+	curl -sS -X POST -u admin:adminadmin http://localhost:9090/admin/dedup/clear
 
 .PHONY: docker-multiarch
 docker-multiarch: ## build linux/amd64 + linux/arm64 image

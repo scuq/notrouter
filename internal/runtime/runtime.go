@@ -47,6 +47,15 @@ type Pipeline struct {
 	// receiver's constructor.
 	webhookVerifier receivers.WebhookKeyVerifier
 
+	// syslogFilter is the early-drop whitelist applied to raw syslog
+	// frames. nil means "filter disabled" (the receivers' Allow() short-
+	// circuits on nil receivers, so this is the cheap path).
+	syslogFilter *receivers.SyslogFilter
+
+	// syslogFilterStop terminates the periodic summary-log goroutine
+	// at pipeline shutdown. nil if the filter is disabled.
+	syslogFilterStop func()
+
 	stopped bool
 	stopMu  sync.Mutex
 }
@@ -151,14 +160,21 @@ func (p *Pipeline) Start(parent context.Context) error {
 		closeInstances(p.instances, p.log)
 		return fmt.Errorf("webhook receiver: %w", err)
 	}
-	udp := receivers.NewSyslogUDP(p.cfg.Listen.SyslogUDP, p.pl.RawCh, p.log)
+	// Build the syslog early-drop filter from config (if enabled).
+	// Nil filter means "pass everything", which is the legacy behavior.
+	p.syslogFilter = receivers.NewSyslogFilter(p.cfg.Receivers.Syslog.EarlyFilter, p.log)
+	if p.syslogFilter != nil {
+		p.syslogFilterStop = p.syslogFilter.StartSummaryLogger()
+	}
+
+	udp := receivers.NewSyslogUDPWithFilter(p.cfg.Listen.SyslogUDP, p.pl.RawCh, p.syslogFilter, p.log)
 	if err := udp.Start(p.ctx, &p.ioWg); err != nil {
 		p.cancel()
 		p.pl.Wait()
 		closeInstances(p.instances, p.log)
 		return fmt.Errorf("syslog-udp receiver: %w", err)
 	}
-	tcp := receivers.NewSyslogTCP(p.cfg.Listen.SyslogTCP, p.pl.RawCh, p.log)
+	tcp := receivers.NewSyslogTCPWithFilter(p.cfg.Listen.SyslogTCP, p.pl.RawCh, p.syslogFilter, p.log)
 	if err := tcp.Start(p.ctx, &p.ioWg); err != nil {
 		p.cancel()
 		p.pl.Wait()
@@ -176,6 +192,12 @@ func (p *Pipeline) Stop() {
 	}
 	p.stopped = true
 	p.stopMu.Unlock()
+
+	// Stop the filter summary logger first so it gets a final flush
+	// before the pipeline tears down. Safe to call when nil.
+	if p.syslogFilterStop != nil {
+		p.syslogFilterStop()
+	}
 
 	p.log.Info("pipeline stop: cancelling context")
 	p.cancel()

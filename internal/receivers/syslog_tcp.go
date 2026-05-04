@@ -33,10 +33,15 @@ type SyslogTCPReceiver struct {
 	rawCh    chan<- *pipeline.RawEvent
 	log      *slog.Logger
 	listener net.Listener
+	filter   *SyslogFilter
 }
 
 func NewSyslogTCP(addr string, rawCh chan<- *pipeline.RawEvent, log *slog.Logger) *SyslogTCPReceiver {
 	return &SyslogTCPReceiver{addr: addr, rawCh: rawCh, log: log}
+}
+
+func NewSyslogTCPWithFilter(addr string, rawCh chan<- *pipeline.RawEvent, filter *SyslogFilter, log *slog.Logger) *SyslogTCPReceiver {
+	return &SyslogTCPReceiver{addr: addr, rawCh: rawCh, log: log, filter: filter}
 }
 
 func (s *SyslogTCPReceiver) Name() string { return "syslog-tcp" }
@@ -100,6 +105,13 @@ func (s *SyslogTCPReceiver) handleConn(ctx context.Context, wg *sync.WaitGroup, 
 			return
 		}
 		if len(frame) == 0 {
+			continue
+		}
+
+		// Filter runs before event allocation, same as UDP path. The
+		// frame slice is bufio's internal buffer (or freshly read for
+		// octet-counted) - safe to pass to filter, no copy needed.
+		if !s.filter.Allow(frame) {
 			continue
 		}
 

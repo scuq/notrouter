@@ -12,14 +12,21 @@ import (
 )
 
 type SyslogUDPReceiver struct {
-	addr  string
-	rawCh chan<- *pipeline.RawEvent
-	log   *slog.Logger
-	conn  net.PacketConn
+	addr   string
+	rawCh  chan<- *pipeline.RawEvent
+	log    *slog.Logger
+	conn   net.PacketConn
+	filter *SyslogFilter // nil means pass everything (legacy/disabled behavior)
 }
 
 func NewSyslogUDP(addr string, rawCh chan<- *pipeline.RawEvent, log *slog.Logger) *SyslogUDPReceiver {
 	return &SyslogUDPReceiver{addr: addr, rawCh: rawCh, log: log}
+}
+
+// NewSyslogUDPWithFilter wires in the early-drop filter. If filter is
+// nil, behaves identically to NewSyslogUDP.
+func NewSyslogUDPWithFilter(addr string, rawCh chan<- *pipeline.RawEvent, filter *SyslogFilter, log *slog.Logger) *SyslogUDPReceiver {
+	return &SyslogUDPReceiver{addr: addr, rawCh: rawCh, log: log, filter: filter}
 }
 
 func (s *SyslogUDPReceiver) Name() string { return "syslog-udp" }
@@ -50,6 +57,16 @@ func (s *SyslogUDPReceiver) Start(ctx context.Context, wg *sync.WaitGroup) error
 				}
 			}
 
+			// Early-drop filter runs against the raw datagram bytes BEFORE
+			// any allocation. On a 99% drop workload at 50k msg/s this
+			// avoids 49,500 event allocations per second + their downstream
+			// pipeline work. Filter returns true (admit) when nil.
+			if !s.filter.Allow(buf[:n]) {
+				continue
+			}
+
+			// Now pay the allocation cost - we know this message is going
+			// to enter the pipeline.
 			payload := make([]byte, n)
 			copy(payload, buf[:n])
 

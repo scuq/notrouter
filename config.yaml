@@ -30,6 +30,16 @@ receivers:
         profile: nagios
       - path: /webhook/generic
         profile: generic
+  syslog:
+    early_filter:
+      enabled: false
+      case_insensitive: false       # default; firewall codes are case-stable
+      log_interval: 10m             # optional; defaults to 10min
+      include_patterns:
+        # Order matters - put high-volume patterns FIRST. Match returns
+        # on first hit. After the first 10-min summary, re-order by hit
+        # count so the cheapest patterns short-circuit early.
+        - "Failed login"
 
 profiles:
   nagios:
