@@ -27,9 +27,6 @@ import (
 	"github.com/scuq/notrouter/internal/suppress"
 )
 
-// Pipeline is one running incarnation of the event flow. Each Build()
-// produces a fresh one with its own goroutines, channels, plugin clients,
-// and listener sockets.
 type Pipeline struct {
 	cfg       *config.Config
 	pl        *pipeline.Pipeline
@@ -38,21 +35,26 @@ type Pipeline struct {
 	dispatch  *dispatch.Dispatcher
 	instances map[string]plugins.Instance
 
-	// Lifecycle bookkeeping. ctx/cancel govern the pipeline goroutines.
-	// ioWg tracks the receiver+admin goroutines spawned via Start().
 	ctx    context.Context
 	cancel context.CancelFunc
 	ioWg   sync.WaitGroup
 	log    *slog.Logger
 
+	// webhookVerifier is passed into the webhook receiver so it can
+	// authenticate incoming POSTs against creds.json webhook keys.
+	// Lives at the Pipeline level rather than per-receiver so we can
+	// thread it cleanly through Build->Start without growing every
+	// receiver's constructor.
+	webhookVerifier receivers.WebhookKeyVerifier
+
 	stopped bool
 	stopMu  sync.Mutex
 }
 
-// Build constructs a pipeline ready to be Start()ed. It performs all the
-// allocations and wiring that used to live in main.go's run() function.
-// On any error nothing is started and partial allocations are released.
-func Build(cfg *config.Config, log *slog.Logger) (*Pipeline, error) {
+// Build constructs a pipeline ready to be Start()ed. The webhookVerifier
+// is optional - pass nil to get the legacy "no auth" webhook behavior.
+// In production wiring (main.go), main always passes the creds store.
+func Build(cfg *config.Config, log *slog.Logger, webhookVerifier receivers.WebhookKeyVerifier) (*Pipeline, error) {
 	instances, err := buildInstances(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("build plugin instances: %w", err)
@@ -110,30 +112,41 @@ func Build(cfg *config.Config, log *slog.Logger) (*Pipeline, error) {
 	pl.AddStage(tracker)
 
 	return &Pipeline{
-		cfg:       cfg,
-		pl:        pl,
-		tracker:   tracker,
-		dedup:     deduper,
-		dispatch:  dsp,
-		instances: instances,
-		log:       log,
+		cfg:             cfg,
+		pl:              pl,
+		tracker:         tracker,
+		dedup:           deduper,
+		dispatch:        dsp,
+		instances:       instances,
+		log:             log,
+		webhookVerifier: webhookVerifier,
 	}, nil
 }
 
-// Start launches all goroutines: pipeline stages, receivers, and any
-// other goroutines this pipeline needs. The receivers bind their listener
-// sockets here - if any port is taken, this returns an error and the
-// caller can rebuild from LKG without having torn anything down yet.
 func (p *Pipeline) Start(parent context.Context) error {
 	p.ctx, p.cancel = context.WithCancel(parent)
 	p.pl.Start(p.ctx)
 
-	wh := receivers.NewWebhook(p.cfg.Listen.Webhook, p.cfg.Receivers.Webhook.Endpoints, p.pl.RawCh, p.log)
+	// Webhook receiver wiring:
+	//   - If we have a verifier, use NewWebhookWithAuth - the receiver
+	//     enforces auth based on its own logic (key existence + config flag).
+	//   - If verifier is nil (test path), fall back to legacy NewWebhook
+	//     so existing test code doesn't break.
+	var wh *receivers.WebhookReceiver
+	if p.webhookVerifier != nil {
+		wh = receivers.NewWebhookWithAuth(
+			p.cfg.Listen.Webhook,
+			p.cfg.Receivers.Webhook.Endpoints,
+			p.pl.RawCh,
+			p.log,
+			p.webhookVerifier,
+			p.cfg.Receivers.Webhook.RequireAuth,
+		)
+	} else {
+		wh = receivers.NewWebhook(p.cfg.Listen.Webhook, p.cfg.Receivers.Webhook.Endpoints, p.pl.RawCh, p.log)
+	}
 	if err := wh.Start(p.ctx, &p.ioWg); err != nil {
 		p.cancel()
-		// pipeline.Wait() blocks until stages drain; safe even though we
-		// never started any receivers - the pipeline goroutines respect
-		// the cancel and exit promptly.
 		p.pl.Wait()
 		closeInstances(p.instances, p.log)
 		return fmt.Errorf("webhook receiver: %w", err)
@@ -155,9 +168,6 @@ func (p *Pipeline) Start(parent context.Context) error {
 	return nil
 }
 
-// Stop tears down the pipeline. After Stop returns, all goroutines have
-// exited, plugin Close() has been called, and listener sockets have been
-// released. Idempotent.
 func (p *Pipeline) Stop() {
 	p.stopMu.Lock()
 	if p.stopped {
@@ -170,11 +180,7 @@ func (p *Pipeline) Stop() {
 	p.log.Info("pipeline stop: cancelling context")
 	p.cancel()
 
-	// Wait for receivers + admin (if any) bound to our wg.
 	p.ioWg.Wait()
-
-	// Close the receivers' input channel so the resolver stage exits its
-	// for-range loop, which cascades through the pipeline.
 	close(p.pl.RawCh)
 	p.pl.Wait()
 
@@ -182,9 +188,6 @@ func (p *Pipeline) Stop() {
 	p.log.Info("pipeline stopped")
 }
 
-// Probes returns the admin probes for this pipeline. Called by the
-// reloader after each successful rebuild so the admin server's
-// /admin/state and dashboard reflect the new pipeline.
 func (p *Pipeline) Probes() admin.Probes {
 	return admin.Probes{
 		Dispatch: p.dispatch,
@@ -193,8 +196,6 @@ func (p *Pipeline) Probes() admin.Probes {
 	}
 }
 
-// Config returns the config this pipeline was built from. Used by the
-// admin UI to show what's currently running.
 func (p *Pipeline) Config() *config.Config { return p.cfg }
 
 func buildInstances(cfg *config.Config) (map[string]plugins.Instance, error) {

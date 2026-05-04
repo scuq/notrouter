@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>notrouter // webhook keys</title>
+  <link rel="stylesheet" href="/admin/ui/static/style.css">
+</head>
+<body class="app-page">
+  <div class="terminal">
+    <div class="terminal-header">
+      <h1>notrouter // webhook keys</h1>
+      <nav class="nav">
+        <a href="/admin/ui/">overview</a>
+        <a href="/admin/ui/config">config</a>
+        <a href="/admin/ui/logs">logs</a>
+        <a href="/admin/ui/test">test</a>
+        <a href="/admin/ui/tokens">tokens</a>
+        <a href="/admin/ui/webhook-keys" class="active">webhook keys</a>
+        {{ range $k, $v := .Links }}<a href="{{ $v }}" target="_blank" rel="noopener">{{ $k }}</a>{{ end }}
+        <a href="/admin/ui/change-password">change password</a>
+        <form method="POST" action="/admin/api/logout" style="display:inline; margin:0;">
+          <input type="hidden" name="csrf" value="{{ .CSRF }}">
+          <button type="submit" style="all:unset; cursor:pointer; color:#1ea53a; letter-spacing:1.5px; text-transform:uppercase; font-size:.82rem; text-shadow: 0 0 3px rgba(30, 165, 58, .25);" onmouseover="this.style.color='#00ff41'" onmouseout="this.style.color='#1ea53a'">logout</button>
+        </form>
+      </nav>
+    </div>
+
+    <div class="cfg-help">
+      <p>
+        webhook keys authenticate incoming events at <code>POST /webhook/&lt;profile&gt;</code>.
+        senders include the key as <code>authorization: bearer notr_wh_...</code> on every
+        request. keys do not expire - they live until revoked here.
+      </p>
+      <p>
+        <strong>auth enforcement:</strong>
+        {{ if .RequireAuth }}
+          <span class="cfg-status error" style="display:inline-block;padding:.15rem .5rem">REQUIRED (config flag set)</span>
+          all webhook posts must authenticate, even if zero keys are minted (which would
+          lock everyone out).
+        {{ else if .AuthActive }}
+          <span class="cfg-status ok" style="display:inline-block;padding:.15rem .5rem">ACTIVE</span>
+          at least one key exists, so all webhook posts must authenticate.
+        {{ else }}
+          <span class="cfg-status info" style="display:inline-block;padding:.15rem .5rem">OPEN</span>
+          no keys exist - the webhook receiver accepts unauthenticated posts.
+          <strong>mint your first key below to turn enforcement on.</strong>
+        {{ end }}
+      </p>
+    </div>
+
+    <h2>create new key</h2>
+    <div class="test-form">
+      <label class="inline grow">
+        <span>label (3-50 chars, required)</span>
+        <input type="text" id="wk-label" placeholder="nagios-prod, grafana-alerting, ..." maxlength="50">
+      </label>
+      <button type="button" id="wk-mint" class="inline-btn">create</button>
+    </div>
+
+    <div id="wk-status" class="cfg-status"></div>
+
+    <div id="wk-fresh" class="tok-fresh" style="display:none;">
+      <div class="tok-fresh-header">
+        ⚠ NEW WEBHOOK KEY - copy now, this is the only time it will be shown
+      </div>
+      <div class="tok-fresh-value">
+        <code id="wk-fresh-code"></code>
+      </div>
+      <div class="tok-fresh-actions">
+        <button type="button" id="wk-copy" class="inline-btn">copy to clipboard</button>
+        <button type="button" id="wk-dismiss" class="inline-btn">i saved it, dismiss</button>
+      </div>
+    </div>
+
+    <h2>existing keys</h2>
+    <table id="wk-table">
+      <thead>
+        <tr>
+          <th>label</th>
+          <th>created by</th>
+          <th>created</th>
+          <th>last used</th>
+          <th>actions</th>
+        </tr>
+      </thead>
+      <tbody id="wk-tbody">
+        <tr><td colspan="5" style="color:#1ea53a">loading_</td></tr>
+      </tbody>
+    </table>
+
+    <div class="footer">
+      <span>signed in as {{ .User }}</span>
+      <span>keys live in <code>{{ .CredsPath }}</code></span>
+    </div>
+  </div>
+
+  <script src="/admin/ui/static/webhook_keys.js"></script>
+</body>
+</html>

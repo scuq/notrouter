@@ -87,7 +87,7 @@ func run(configPath string) error {
 	parentCtx, cancelParent := context.WithCancel(context.Background())
 	defer cancelParent()
 
-	initial, err := runtime.Build(cfg, log)
+	initial, err := runtime.Build(cfg, log, credStore)
 	if err != nil {
 		return fmt.Errorf("build initial pipeline: %w", err)
 	}
@@ -95,7 +95,7 @@ func run(configPath string) error {
 		return fmt.Errorf("start initial pipeline: %w", err)
 	}
 
-	reloader := runtime.NewReloader(parentCtx, log, initial)
+	reloader := runtime.NewReloader(parentCtx, log, initial, credStore)
 
 	adm, err := admin.NewWithUI(
 		cfg.Listen.Admin,

@@ -16,6 +16,7 @@
         <a href="/admin/ui/logs" class="active">logs</a>
         <a href="/admin/ui/test">test</a>
         <a href="/admin/ui/tokens">tokens</a>
+        <a href="/admin/ui/webhook-keys">webhook keys</a>
         {{ range $k, $v := .Links }}<a href="{{ $v }}" target="_blank" rel="noopener">{{ $k }}</a>{{ end }}
         <a href="/admin/ui/change-password">change password</a>
         <form method="POST" action="/admin/api/logout" style="display:inline; margin:0;">

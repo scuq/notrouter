@@ -54,6 +54,7 @@ type uiHandler struct {
 	tmplLogs     *template.Template
 	tmplTest     *template.Template
 	tmplTokens   *template.Template
+	tmplWebhookKeys *template.Template
 	staticFS     http.FileSystem
 	store        *SessionStore
 	creds        credsAccessor
@@ -96,6 +97,10 @@ type credsAccessor interface {
 	RefreshTokenByHash(hash, requestingUser string) (*creds.TokenView, error)
 	RefreshTokenSelf(plain string) (*creds.TokenView, error)
 	RevokeTokenByHash(hash, requestingUser string) error
+	MintWebhookKey(createdBy, label string) (*creds.WebhookKeyMintResult, error)
+	ListWebhookKeys() []creds.WebhookKeyView
+	RevokeWebhookKeyByHash(hash string) error
+	HasAnyWebhookKey() bool
 }
 
 func newUIHandler(
@@ -135,6 +140,10 @@ func newUIHandler(
 	if err != nil {
 		return nil, err
 	}
+	wkTpl, err := template.ParseFS(uiFS, "ui/webhook_keys.html")
+	if err != nil {
+		return nil, err
+	}
 	staticSub, err := fs.Sub(uiFS, "ui/static")
 	if err != nil {
 		return nil, err
@@ -147,6 +156,7 @@ func newUIHandler(
 		tmplLogs:     logsTpl,
 		tmplTest:     testTpl,
 		tmplTokens:   tokensTpl,
+		tmplWebhookKeys: wkTpl,
 		staticFS:     http.FS(staticSub),
 		store:        store,
 		creds:        creds,
@@ -194,6 +204,12 @@ func (h *uiHandler) register(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/tokens/refresh", h.requireAuth(h.handleAPITokensRefresh))
 	mux.HandleFunc("/admin/api/tokens/refresh-self", h.requireAuth(h.handleAPITokensRefreshSelf))
 	mux.HandleFunc("/admin/api/tokens/revoke", h.requireAuth(h.handleAPITokensRevoke))
+
+	// Webhook keys (v0.2.3): mint/list/revoke. No refresh - keys don't expire.
+	mux.HandleFunc("/admin/ui/webhook-keys", h.requireAuth(h.handleWebhookKeysPage))
+	mux.HandleFunc("/admin/api/webhook-keys", h.requireAuth(h.handleAPIWebhookKeysList))
+	mux.HandleFunc("/admin/api/webhook-keys/mint", h.requireAuth(h.handleAPIWebhookKeysMint))
+	mux.HandleFunc("/admin/api/webhook-keys/revoke", h.requireAuth(h.handleAPIWebhookKeysRevoke))
 }
 
 // requireAuth is the new gating middleware. It accepts:
@@ -941,6 +957,102 @@ func tokenErrStatus(err error) int {
 	default:
 		return http.StatusInternalServerError
 	}
+}
+
+// --- API: webhook keys ---
+
+type webhookKeyMintRequest struct {
+	Label string `json:"label"`
+}
+
+type webhookKeyHashRequest struct {
+	Hash string `json:"hash"`
+}
+
+func (h *uiHandler) handleWebhookKeysPage(w http.ResponseWriter, r *http.Request) {
+	user := r.Header.Get("X-Notrouter-User")
+	_, csrf, _ := h.store.Get(readSessionCookie(r))
+	h.writeCSRFCookie(w, r, csrf)
+	cfg := h.currentCfg()
+	h.renderTemplate(w, h.tmplWebhookKeys, map[string]interface{}{
+		"User":        user,
+		"CSRF":        csrf,
+		"Version":     version.Version,
+		"Commit":      version.Commit,
+		"Links":       cfg.Links,
+		"CredsPath":   h.credsPath,
+		"AuthActive":  h.creds.HasAnyWebhookKey(),
+		"RequireAuth": cfg.Receivers.Webhook.RequireAuth,
+	})
+}
+
+func (h *uiHandler) handleAPIWebhookKeysList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"GET required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	keys := h.creds.ListWebhookKeys()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"keys":  keys,
+		"count": len(keys),
+	})
+}
+
+func (h *uiHandler) handleAPIWebhookKeysMint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.requireCSRFIfCookie(r, true); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{"error": "invalid csrf"})
+		return
+	}
+	req := &webhookKeyMintRequest{}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": "bad request body: " + err.Error()})
+		return
+	}
+	user := r.Header.Get("X-Notrouter-User")
+	res, err := h.creds.MintWebhookKey(user, req.Label)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	h.log.Info("webhook key minted",
+		"user", user,
+		"label", req.Label,
+		"hash", res.View.Hash)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"key":  res.Key,
+		"view": res.View,
+	})
+}
+
+func (h *uiHandler) handleAPIWebhookKeysRevoke(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.requireCSRFIfCookie(r, true); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{"error": "invalid csrf"})
+		return
+	}
+	req := &webhookKeyHashRequest{}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	if err := h.creds.RevokeWebhookKeyByHash(req.Hash); err != nil {
+		status := http.StatusBadRequest
+		if err.Error() == "webhook key not found" {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	user := r.Header.Get("X-Notrouter-User")
+	h.log.Warn("webhook key revoked", "user", user, "hash", req.Hash)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 }
 
 func loopbackURL(listen string) string {

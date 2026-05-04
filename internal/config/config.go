@@ -82,6 +82,12 @@ type ReceiversConfig struct {
 
 type WebhookReceiverConfig struct {
 	Endpoints []WebhookEndpoint `yaml:"endpoints"`
+
+	// RequireAuth, when true, forces every webhook POST to authenticate
+	// even if zero webhook keys exist (which would lock everyone out).
+	// Default false: enforcement turns on automatically once the first
+	// key is minted via the UI - safe rollout, no surprise lockouts.
+	RequireAuth bool `yaml:"require_auth"`
 }
 
 type WebhookEndpoint struct {

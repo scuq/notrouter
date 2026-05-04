@@ -2,19 +2,20 @@
 // The store lives at a configurable path (default /var/lib/notrouter/creds.json)
 // so it can be a separate writable volume from the read-only config bind mount.
 //
-// Schema v2 (current):
+// Schema v3 (current):
 //
 //	{
-//	  "version": 2,
-//	  "admin": {"password_hash": "$2a$...", "must_change": false, "updated_at": "..."},
-//	  "oidc":   null | { issuer, client_id, client_secret, ... },
-//	  "users":  {},   // populated by OIDC logins (planned v0.3)
-//	  "tokens": {}    // API tokens keyed by sha256(value) (planned v0.2.2)
+//	  "version": 3,
+//	  "admin":        {"password_hash": "$2a$...", "must_change": false, "updated_at": "..."},
+//	  "oidc":         null | { issuer, client_id, ... },
+//	  "users":        {},                  // OIDC users (planned v0.3)
+//	  "tokens":       {},                  // API tokens (v0.2.2)
+//	  "webhook_keys": {}                   // webhook ingest keys (v0.2.3)
 //	}
 //
-// Schema v1 (legacy): no "version" field, only "admin" and "oidc".
-// Read-time migration upgrades v1 -> v2 silently and writes back, preserving
-// the admin entry untouched.
+// Schema migrations are read-time and silent:
+//   - v0/v1 (no version field) -> v3
+//   - v2 (had no webhook_keys) -> v3
 package creds
 
 import (
@@ -30,33 +31,24 @@ import (
 )
 
 const (
-	// bcryptCost is the work factor. 10 = ~60ms verify, fine for login,
-	// expensive enough vs brute force on a leaked file.
-	bcryptCost = 10
-
-	// initialPasswordPlain is what the file gets seeded with when missing.
+	bcryptCost           = 10
 	initialPasswordPlain = "admin"
-
-	// CurrentSchemaVersion is the version we write. Reads accept v1 (no
-	// "version" field) and migrate.
-	CurrentSchemaVersion = 2
+	CurrentSchemaVersion = 3
 )
 
-// Store is a thread-safe credentials accessor backed by a JSON file.
 type Store struct {
 	path string
 	mu   sync.RWMutex
 	data fileShape
 }
 
-// fileShape is the exact JSON layout. New fields are additive; renaming
-// requires a schema bump.
 type fileShape struct {
-	Version int                    `json:"version"`
-	Admin   AdminCreds             `json:"admin"`
-	OIDC    *OIDCCreds             `json:"oidc,omitempty"`
-	Users   map[string]UserRecord  `json:"users,omitempty"`
-	Tokens  map[string]TokenRecord `json:"tokens,omitempty"`
+	Version     int                         `json:"version"`
+	Admin       AdminCreds                  `json:"admin"`
+	OIDC        *OIDCCreds                  `json:"oidc,omitempty"`
+	Users       map[string]UserRecord       `json:"users,omitempty"`
+	Tokens      map[string]TokenRecord      `json:"tokens,omitempty"`
+	WebhookKeys map[string]WebhookKeyRecord `json:"webhook_keys,omitempty"`
 }
 
 type AdminCreds struct {
@@ -65,8 +57,6 @@ type AdminCreds struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// OIDCCreds is reserved for future use. Field shape is intentionally
-// generic for now - the v0.3 OIDC pass may reshape it.
 type OIDCCreds struct {
 	Issuer        string   `json:"issuer,omitempty"`
 	ClientID      string   `json:"client_id,omitempty"`
@@ -78,8 +68,6 @@ type OIDCCreds struct {
 	AdminGroups   []string `json:"admin_groups,omitempty"`
 }
 
-// UserRecord is bookkeeping for an OIDC user. Identity is the OIDC
-// subject claim; everything else is informational.
 type UserRecord struct {
 	Subject     string    `json:"subject"`
 	Email       string    `json:"email,omitempty"`
@@ -87,9 +75,6 @@ type UserRecord struct {
 	LastSeenAt  time.Time `json:"last_seen_at"`
 }
 
-// TokenRecord describes one API token. Keyed in fileShape.Tokens by the
-// SHA-256 of the token value (so leaking creds.json doesn't reveal usable
-// tokens). Implementation lands in v0.2.2.
 type TokenRecord struct {
 	User       string    `json:"user"`
 	Label      string    `json:"label,omitempty"`
@@ -98,8 +83,15 @@ type TokenRecord struct {
 	LastUsedAt time.Time `json:"last_used_at,omitempty"`
 }
 
-// Open returns a Store, creating the file with default credentials if
-// missing. Migrates legacy schemas in-place on first read.
+// WebhookKeyRecord is one minted webhook ingest key. No expiry - they
+// live until revoked. CreatedBy is the username that minted it (audit).
+type WebhookKeyRecord struct {
+	Label      string    `json:"label"`
+	CreatedBy  string    `json:"created_by,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastUsedAt time.Time `json:"last_used_at,omitempty"`
+}
+
 func Open(path string) (*Store, error) {
 	s := &Store{path: path}
 	if err := s.load(); err != nil {
@@ -111,8 +103,6 @@ func Open(path string) (*Store, error) {
 		}
 		return s, nil
 	}
-
-	// Successful load. If we read an old-schema file, migrate and persist.
 	if s.migrateIfNeeded() {
 		if err := s.persist(); err != nil {
 			return nil, fmt.Errorf("persist migrated creds: %w", err)
@@ -131,24 +121,22 @@ func (s *Store) load() error {
 	return json.Unmarshal(b, &s.data)
 }
 
-// migrateIfNeeded brings older schema versions up to CurrentSchemaVersion.
-// Returns true if a migration happened and persist is needed.
-//
-// v1 (no version field) -> v2: just stamp version and ensure maps exist.
+// migrateIfNeeded handles all version transitions inline. Each version
+// bump is a small additive step - we never remove fields from the JSON,
+// and unknown fields in older readers just get ignored.
 func (s *Store) migrateIfNeeded() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.data.Version >= CurrentSchemaVersion {
-		// Already current. Still ensure maps are non-nil so callers can
-		// write directly without nil-check; this isn't a "migration" per
-		// se but cheap and harmless.
 		s.ensureMaps()
 		return false
 	}
 
-	// v0/v1 -> v2.
-	s.data.Version = 2
+	// Any older version -> CurrentSchemaVersion. Maps get ensured below;
+	// admin block already has whatever it had before. Future versions
+	// would add additional steps here.
+	s.data.Version = CurrentSchemaVersion
 	s.ensureMaps()
 	return true
 }
@@ -159,6 +147,9 @@ func (s *Store) ensureMaps() {
 	}
 	if s.data.Tokens == nil {
 		s.data.Tokens = make(map[string]TokenRecord)
+	}
+	if s.data.WebhookKeys == nil {
+		s.data.WebhookKeys = make(map[string]WebhookKeyRecord)
 	}
 }
 
@@ -175,15 +166,14 @@ func (s *Store) seedInitial() error {
 			MustChange:   true,
 			UpdatedAt:    time.Now().UTC(),
 		},
-		Users:  make(map[string]UserRecord),
-		Tokens: make(map[string]TokenRecord),
+		Users:       make(map[string]UserRecord),
+		Tokens:      make(map[string]TokenRecord),
+		WebhookKeys: make(map[string]WebhookKeyRecord),
 	}
 	s.mu.Unlock()
 	return s.persist()
 }
 
-// persist writes atomically: write to temp + rename. Avoids a half-
-// written file locking everyone out if the process is killed mid-write.
 func (s *Store) persist() error {
 	s.mu.RLock()
 	b, err := json.MarshalIndent(s.data, "", "  ")
@@ -200,7 +190,7 @@ func (s *Store) persist() error {
 		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op if rename succeeded
+	defer os.Remove(tmpName)
 
 	if _, err := tmp.Write(b); err != nil {
 		tmp.Close()
@@ -216,8 +206,6 @@ func (s *Store) persist() error {
 	return os.Rename(tmpName, s.path)
 }
 
-// Verify checks a plaintext password against the stored hash.
-// Constant-time-equivalent via bcrypt internals.
 func (s *Store) Verify(plain string) bool {
 	s.mu.RLock()
 	hash := s.data.Admin.PasswordHash
@@ -228,22 +216,18 @@ func (s *Store) Verify(plain string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(plain)) == nil
 }
 
-// MustChange returns whether the admin password is still the seed value.
 func (s *Store) MustChange() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.data.Admin.MustChange
 }
 
-// UpdatedAt returns when the password was last changed.
 func (s *Store) UpdatedAt() time.Time {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.data.Admin.UpdatedAt
 }
 
-// SetPassword updates the admin password, clears MustChange, persists.
-// Caller is responsible for verifying the OLD password first.
 func (s *Store) SetPassword(newPlain string) error {
 	if len(newPlain) < 8 {
 		return errors.New("password must be at least 8 characters")
@@ -260,8 +244,6 @@ func (s *Store) SetPassword(newPlain string) error {
 	return s.persist()
 }
 
-// SchemaVersion returns the current persisted schema version. Useful for
-// tests and the about page.
 func (s *Store) SchemaVersion() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
