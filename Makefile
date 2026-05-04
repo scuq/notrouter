@@ -142,3 +142,117 @@ docker-multiarch: ## build linux/amd64 + linux/arm64 image
 .PHONY: docker-load
 docker-load: ## build local-arch image and load it into docker
 	docker buildx build --load -t notrouter:$(VERSION) .
+
+# ---- inner-loop dev workflow (final) ----
+# Detects the available container runtime + compose flavor at make time.
+# Override either at invocation:  make dev-docker CONTAINER_CMD="podman compose"
+#
+# Precedence: docker compose -> podman-compose -> podman compose ->
+#             docker-compose -> error.
+CONTAINER_CMD ?= $(shell \
+	if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then \
+		echo "docker compose"; \
+	elif command -v podman-compose >/dev/null 2>&1; then \
+		echo "podman-compose"; \
+	elif command -v podman >/dev/null 2>&1 && podman compose version >/dev/null 2>&1; then \
+		echo "podman compose"; \
+	elif command -v docker-compose >/dev/null 2>&1; then \
+		echo "docker-compose"; \
+	else \
+		echo "NONE"; \
+	fi)
+
+# Containerfile (Podman-native) takes precedence over Dockerfile if both
+# exist. Override:  make dev-docker DEV_DOCKERFILE=Dockerfile
+DEV_DOCKERFILE ?= $(shell \
+	if [ -f Containerfile ]; then echo Containerfile; \
+	elif [ -f Dockerfile ]; then echo Dockerfile; \
+	else echo Dockerfile; fi)
+
+DEV_SERVICE ?= notrouter
+DEV_COMPOSE ?= $(shell \
+	if [ -f compose.yaml ]; then echo compose.yaml; \
+	elif [ -f docker-compose.yml ]; then echo docker-compose.yml; \
+	elif [ -f docker-compose.yaml ]; then echo docker-compose.yaml; \
+	else echo compose.yaml; fi)
+
+.PHONY: _dev-docker-preflight
+_dev-docker-preflight:
+	@if [ "$(CONTAINER_CMD)" = "NONE" ]; then \
+		echo "ERROR: no container compose runtime found."; \
+		echo "  install one of: docker (with 'docker compose'), podman-compose, podman 4.4+"; \
+		echo "  or override:  make dev-docker CONTAINER_CMD=\"podman compose\""; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(DEV_COMPOSE)" ]; then \
+		echo "ERROR: no compose file found (looked for compose.yaml, docker-compose.yml, docker-compose.yaml)"; \
+		echo "  generate a default with:  make dev-docker-init"; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(DEV_DOCKERFILE)" ]; then \
+		echo "ERROR: $(DEV_DOCKERFILE) not found"; \
+		exit 1; \
+	fi
+
+.PHONY: dev-docker-init
+dev-docker-init: ## generate a default compose.yaml if missing
+	@set -e; \
+	if [ -f compose.yaml ] || [ -f docker-compose.yml ] || [ -f docker-compose.yaml ]; then \
+		echo "compose file already present - skipping"; \
+		exit 0; \
+	fi; \
+	echo "writing compose.yaml (using $(DEV_DOCKERFILE))"; \
+	{ \
+		echo 'services:'; \
+		echo '  notrouter:'; \
+		echo '    build:'; \
+		echo '      context: .'; \
+		echo "      dockerfile: $(DEV_DOCKERFILE)"; \
+		echo '    image: notrouter:dev'; \
+		echo '    container_name: notrouter'; \
+		echo '    restart: unless-stopped'; \
+		echo '    ports:'; \
+		echo '      - "8080:8080"'; \
+		echo '      - "5514:5514/udp"'; \
+		echo '      - "5514:5514/tcp"'; \
+		echo '      - "9090:9090"'; \
+		echo '    volumes:'; \
+		echo '      - ./config.yaml:/etc/notrouter/config.yaml:ro'; \
+		echo '      - notrouter-creds:/var/lib/notrouter'; \
+		echo '      - notrouter-audit:/var/log/notrouter'; \
+		echo '    healthcheck:'; \
+		echo '      test: ["CMD", "/notrouter", "-version"]'; \
+		echo '      interval: 30s'; \
+		echo '      timeout: 5s'; \
+		echo '      retries: 3'; \
+		echo ''; \
+		echo 'volumes:'; \
+		echo '  notrouter-creds:'; \
+		echo '  notrouter-audit:'; \
+	} > compose.yaml; \
+	echo "wrote compose.yaml"
+
+.PHONY: dev-docker
+dev-docker: vet _dev-docker-preflight ## rebuild + recreate container + tail logs (docker or podman)
+	@echo ">>> using: $(CONTAINER_CMD), compose=$(DEV_COMPOSE), file=$(DEV_DOCKERFILE)"
+	@echo ">>> rebuilding container image..."
+	$(CONTAINER_CMD) -f $(DEV_COMPOSE) build $(DEV_SERVICE)
+	@echo ">>> recreating container..."
+	$(CONTAINER_CMD) -f $(DEV_COMPOSE) up -d --force-recreate $(DEV_SERVICE)
+	@echo ">>> tailing logs (ctrl+c stops tailing; container keeps running)"
+	$(CONTAINER_CMD) -f $(DEV_COMPOSE) logs -f $(DEV_SERVICE)
+
+.PHONY: dev-docker-restart
+dev-docker-restart: _dev-docker-preflight ## recreate without rebuilding the image
+	$(CONTAINER_CMD) -f $(DEV_COMPOSE) up -d --force-recreate $(DEV_SERVICE)
+	$(CONTAINER_CMD) -f $(DEV_COMPOSE) logs -f $(DEV_SERVICE)
+
+.PHONY: dev-docker-clean
+dev-docker-clean: _dev-docker-preflight ## DESTRUCTIVE: stop and remove volumes
+	@echo "this will delete creds.json, config-backups/, and audit logs"
+	@read -p "type 'yes' to confirm: " ans && [ "$$ans" = "yes" ] || (echo aborted; exit 1)
+	$(CONTAINER_CMD) -f $(DEV_COMPOSE) down -v
+
+.PHONY: dev-logs
+dev-logs: _dev-docker-preflight ## tail logs of the running container (no recreate)
+	$(CONTAINER_CMD) -f $(DEV_COMPOSE) logs -f $(DEV_SERVICE)

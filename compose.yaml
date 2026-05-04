@@ -1,0 +1,26 @@
+services:
+  notrouter:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: notrouter:dev
+    container_name: notrouter
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "5514:5514/udp"
+      - "5514:5514/tcp"
+      - "9090:9090"
+    volumes:
+      - ./config.yaml:/etc/notrouter/config.yaml:ro
+      - notrouter-creds:/var/lib/notrouter
+      - notrouter-audit:/var/log/notrouter
+    healthcheck:
+      test: ["CMD", "/notrouter", "-version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  notrouter-creds:
+  notrouter-audit:
