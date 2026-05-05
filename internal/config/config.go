@@ -24,6 +24,7 @@ type Config struct {
 	Routing         []RoutingRuleConfig       `yaml:"routing"`
 	Dispatch        DispatchConfig            `yaml:"dispatch"`
 	Pipeline        PipelineConfig            `yaml:"pipeline"`
+	Trace           TraceConfig               `yaml:"trace,omitempty"`
 	Links           map[string]string         `yaml:"links"`
 
 	// path and loadedHash are populated by Load(). Not YAML-tagged so they
@@ -141,6 +142,42 @@ type SMTPPort25Config struct {
 	AllowedRcptTo   []string `yaml:"allowed_rcpt_to"`   // exact-match
 	AllowedFrom     []string `yaml:"allowed_from"`      // exact OR @domain suffix; empty = any
 	MaxMessageBytes int      `yaml:"max_message_bytes"` // default 1048576 (1 MiB)
+}
+
+// TraceConfig controls the trace/capture feature - per-receiver raw-data
+// dump to disk for debugging. Default disabled. Per-receiver toggles
+// independent. When enabled, performance is impacted (synchronous writes).
+//
+// Files written 0600, directory 0700. Sensitive data (auth headers, alert
+// details) WILL appear in trace files - operators should treat the output
+// directory as containing secrets.
+type TraceConfig struct {
+	Enabled          bool                  `yaml:"enabled"`
+	OutputDir        string                `yaml:"output_dir"`         // default /var/log/notrouter/trace
+	ReminderInterval time.Duration         `yaml:"reminder_interval"`  // how often to log "trace is on"; default 1h
+	Receivers        TraceReceiversConfig  `yaml:"receivers"`
+}
+
+// TraceReceiversConfig holds per-receiver trace toggles. Each block is
+// independent - operators can trace SMTP without tracing syslog, etc.
+type TraceReceiversConfig struct {
+	SMTP      TraceSMTPConfig      `yaml:"smtp"`
+	SyslogUDP TraceAppendConfig    `yaml:"syslog_udp"`
+	SyslogTCP TraceAppendConfig    `yaml:"syslog_tcp"`
+	Webhook   TraceAppendConfig    `yaml:"webhook"`
+}
+
+// TraceSMTPConfig - SMTP traces are one .eml file per message.
+type TraceSMTPConfig struct {
+	Enabled  bool `yaml:"enabled"`
+	MaxFiles int  `yaml:"max_files"` // default 50; oldest deleted when exceeded
+}
+
+// TraceAppendConfig - append-mode JSONL traces (syslog, webhook).
+type TraceAppendConfig struct {
+	Enabled         bool  `yaml:"enabled"`
+	MaxBytesPerFile int64 `yaml:"max_bytes_per_file"` // default 10 MiB
+	MaxFiles        int   `yaml:"max_files"`          // default 3
 }
 
 type ProfileConfig struct {

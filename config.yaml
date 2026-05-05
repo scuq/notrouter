@@ -55,6 +55,28 @@ receivers:
       allowed_from: []
       max_message_bytes: 1048576
 
+
+trace:
+  enabled: true
+  output_dir: /var/log/notrouter/trace
+  reminder_interval: 1h
+  receivers:
+    smtp:
+      enabled: true
+      max_files: 50
+    syslog_udp:
+      enabled: false
+      max_bytes_per_file: 10485760
+      max_files: 3
+    syslog_tcp:
+      enabled: false
+      max_bytes_per_file: 10485760
+      max_files: 3
+    webhook:
+      enabled: false
+      max_bytes_per_file: 10485760
+      max_files: 3
+
 profiles:
   nagios:
     entity:
@@ -169,3 +191,34 @@ pipeline:
   instance_buffer_size: 1024
   resolver_workers: 4
   normalizer_workers: 4
+
+# trace - DEBUG ONLY. Captures raw incoming receiver data to disk for
+# inspection. Default disabled. Per-receiver toggles independent.
+#
+# WHEN ENABLED: performance is impacted, sensitive data is written to
+# disk in cleartext (auth headers, alert details, etc.), and operators
+# get periodic reminders to disable.
+#
+# Output dir is created with 0700 perms; files with 0600. Best practice:
+# mount a separate volume for trace output and exclude from backups.
+#
+# trace:
+#   enabled: true
+#   output_dir: /var/log/notrouter/trace
+#   reminder_interval: 1h
+#   receivers:
+#     smtp:
+#       enabled: true
+#       max_files: 50              # one .eml per message; oldest deleted at limit
+#     syslog_udp:
+#       enabled: false
+#       max_bytes_per_file: 10485760    # 10 MiB
+#       max_files: 3
+#     syslog_tcp:
+#       enabled: false
+#       max_bytes_per_file: 10485760
+#       max_files: 3
+#     webhook:
+#       enabled: false
+#       max_bytes_per_file: 10485760
+#       max_files: 3

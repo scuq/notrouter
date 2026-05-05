@@ -13,6 +13,7 @@ import (
 	"github.com/scuq/notrouter/internal/event"
 	"github.com/scuq/notrouter/internal/metrics"
 	"github.com/scuq/notrouter/internal/pipeline"
+	"github.com/scuq/notrouter/internal/trace"
 )
 
 // Per RFC6587 a TCP syslog stream uses one of two framings:
@@ -34,6 +35,14 @@ type SyslogTCPReceiver struct {
 	log      *slog.Logger
 	listener net.Listener
 	filter   *SyslogFilter
+	tracer   *trace.Tracer
+}
+
+// SetTracer wires in an optional trace.Tracer. nil-safe.
+func (s *SyslogTCPReceiver) SetTracer(t *trace.Tracer) {
+	if s != nil {
+		s.tracer = t
+	}
 }
 
 func NewSyslogTCP(addr string, rawCh chan<- *pipeline.RawEvent, log *slog.Logger) *SyslogTCPReceiver {
@@ -114,6 +123,13 @@ func (s *SyslogTCPReceiver) handleConn(ctx context.Context, wg *sync.WaitGroup, 
 		if !s.filter.Allow(frame) {
 			continue
 		}
+
+		// Trace capture (post-filter). nil-safe.
+		srcStr := "unknown"
+		if remoteIP != nil {
+			srcStr = remoteIP.String()
+		}
+		s.tracer.CaptureSyslogTCP(srcStr, frame)
 
 		ev := event.New("syslog-tcp", frame)
 		if remoteIP != nil {

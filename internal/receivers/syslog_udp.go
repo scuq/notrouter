@@ -9,6 +9,7 @@ import (
 	"github.com/scuq/notrouter/internal/event"
 	"github.com/scuq/notrouter/internal/metrics"
 	"github.com/scuq/notrouter/internal/pipeline"
+	"github.com/scuq/notrouter/internal/trace"
 )
 
 type SyslogUDPReceiver struct {
@@ -17,6 +18,14 @@ type SyslogUDPReceiver struct {
 	log    *slog.Logger
 	conn   net.PacketConn
 	filter *SyslogFilter // nil means pass everything (legacy/disabled behavior)
+	tracer *trace.Tracer
+}
+
+// SetTracer wires in an optional trace.Tracer. nil-safe.
+func (s *SyslogUDPReceiver) SetTracer(t *trace.Tracer) {
+	if s != nil {
+		s.tracer = t
+	}
 }
 
 func NewSyslogUDP(addr string, rawCh chan<- *pipeline.RawEvent, log *slog.Logger) *SyslogUDPReceiver {
@@ -64,6 +73,15 @@ func (s *SyslogUDPReceiver) Start(ctx context.Context, wg *sync.WaitGroup) error
 			if !s.filter.Allow(buf[:n]) {
 				continue
 			}
+
+			// Trace capture (post-filter, pre-allocation). Captures only
+			// admitted datagrams - useful for debugging "what got past my
+			// filter." nil-safe.
+			srcStr := "unknown"
+			if udpAddr, ok := addr.(*net.UDPAddr); ok {
+				srcStr = udpAddr.IP.String()
+			}
+			s.tracer.CaptureSyslogUDP(srcStr, buf[:n])
 
 			// Now pay the allocation cost - we know this message is going
 			// to enter the pipeline.

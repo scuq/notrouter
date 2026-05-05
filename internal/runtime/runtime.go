@@ -22,6 +22,7 @@ import (
 	"github.com/scuq/notrouter/internal/parser"
 	"github.com/scuq/notrouter/internal/pipeline"
 	"github.com/scuq/notrouter/internal/plugins"
+	"github.com/scuq/notrouter/internal/trace"
 	"github.com/scuq/notrouter/internal/receivers"
 	"github.com/scuq/notrouter/internal/router"
 	"github.com/scuq/notrouter/internal/suppress"
@@ -55,6 +56,10 @@ type Pipeline struct {
 	// syslogFilterStop terminates the periodic summary-log goroutine
 	// at pipeline shutdown. nil if the filter is disabled.
 	syslogFilterStop func()
+
+	// tracer for debug-mode capture of incoming receiver data. nil if
+	// trace is globally disabled (the common case).
+	tracer *trace.Tracer
 
 	stopped bool
 	stopMu  sync.Mutex
@@ -154,12 +159,24 @@ func (p *Pipeline) Start(parent context.Context) error {
 	} else {
 		wh = receivers.NewWebhook(p.cfg.Listen.Webhook, p.cfg.Receivers.Webhook.Endpoints, p.pl.RawCh, p.log)
 	}
+	wh.SetTracer(p.tracer)
 	if err := wh.Start(p.ctx, &p.ioWg); err != nil {
 		p.cancel()
 		p.pl.Wait()
 		closeInstances(p.instances, p.log)
 		return fmt.Errorf("webhook receiver: %w", err)
 	}
+	// Build the trace.Tracer if trace is globally enabled. nil otherwise -
+	// receivers' SetTracer is nil-safe so no special handling needed.
+	tracer, err := trace.New(p.cfg.Trace, p.log)
+	if err != nil {
+		p.cancel()
+		p.pl.Wait()
+		closeInstances(p.instances, p.log)
+		return fmt.Errorf("trace: %w", err)
+	}
+	p.tracer = tracer
+
 	// Build the syslog early-drop filter from config (if enabled).
 	// Nil filter means "pass everything", which is the legacy behavior.
 	p.syslogFilter = receivers.NewSyslogFilter(p.cfg.Receivers.Syslog.EarlyFilter, p.log)
@@ -168,6 +185,7 @@ func (p *Pipeline) Start(parent context.Context) error {
 	}
 
 	udp := receivers.NewSyslogUDPWithFilter(p.cfg.Listen.SyslogUDP, p.pl.RawCh, p.syslogFilter, p.log)
+	udp.SetTracer(p.tracer)
 	if err := udp.Start(p.ctx, &p.ioWg); err != nil {
 		p.cancel()
 		p.pl.Wait()
@@ -175,6 +193,7 @@ func (p *Pipeline) Start(parent context.Context) error {
 		return fmt.Errorf("syslog-udp receiver: %w", err)
 	}
 	tcp := receivers.NewSyslogTCPWithFilter(p.cfg.Listen.SyslogTCP, p.pl.RawCh, p.syslogFilter, p.log)
+	tcp.SetTracer(p.tracer)
 	if err := tcp.Start(p.ctx, &p.ioWg); err != nil {
 		p.cancel()
 		p.pl.Wait()
@@ -186,6 +205,9 @@ func (p *Pipeline) Start(parent context.Context) error {
 	// has receivers.smtp.port_25.enabled = true. NewSMTPReceiver returns
 	// (nil, nil) when disabled, which we skip cleanly.
 	smtp25, err := receivers.NewSMTPReceiver(p.cfg.Receivers.SMTP.Port25, p.pl.RawCh, p.log)
+	if smtp25 != nil {
+		smtp25.SetTracer(p.tracer)
+	}
 	if err != nil {
 		p.cancel()
 		p.pl.Wait()
@@ -217,6 +239,7 @@ func (p *Pipeline) Stop() {
 	if p.syslogFilterStop != nil {
 		p.syslogFilterStop()
 	}
+	p.tracer.Stop()
 
 	p.log.Info("pipeline stop: cancelling context")
 	p.cancel()

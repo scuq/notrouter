@@ -18,6 +18,7 @@ import (
 	"github.com/scuq/notrouter/internal/event"
 	"github.com/scuq/notrouter/internal/metrics"
 	"github.com/scuq/notrouter/internal/pipeline"
+	"github.com/scuq/notrouter/internal/trace"
 )
 
 // SMTPReceiver implements an SMTP server that hands accepted messages off
@@ -56,6 +57,19 @@ type SMTPReceiver struct {
 	// Stats. Exposed via /admin/state and Prometheus.
 	accepted atomic.Uint64
 	rejected atomic.Uint64
+
+	// Optional tracer for debug capture. Set via SetTracer() after
+	// construction. nil means trace disabled (zero overhead).
+	tracer *trace.Tracer
+}
+
+// SetTracer wires in an optional trace.Tracer after construction. nil
+// is fine and means trace is disabled for this receiver. Safe to call
+// before Start() but not after - tracer is read on the hot path.
+func (r *SMTPReceiver) SetTracer(t *trace.Tracer) {
+	if r != nil {
+		r.tracer = t
+	}
 }
 
 // NewSMTPReceiver compiles the allowlists and prepares the server. Does
@@ -298,6 +312,10 @@ func (s *smtpSession) Data(r io.Reader) error {
 			Message:      "data read error",
 		}
 	}
+
+	// Trace capture - writes raw RFC 5322 bytes to disk if SMTP trace
+	// is enabled. nil-safe (no-op when tracer is nil).
+	s.recv.tracer.CaptureSMTP(s.from, body)
 
 	parsed, err := parseEmail(body)
 	if err != nil {

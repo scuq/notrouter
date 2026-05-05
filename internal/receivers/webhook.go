@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/scuq/notrouter/internal/event"
 	"github.com/scuq/notrouter/internal/metrics"
 	"github.com/scuq/notrouter/internal/pipeline"
+	"github.com/scuq/notrouter/internal/trace"
 )
 
 // WebhookKeyVerifier is the surface the receiver needs from the creds
@@ -34,6 +36,15 @@ type WebhookReceiver struct {
 	server      *http.Server
 	verifier    WebhookKeyVerifier
 	requireAuth bool // forces auth even when no keys exist
+
+	tracer  *trace.Tracer
+}
+
+// SetTracer wires in an optional trace.Tracer. nil-safe.
+func (w *WebhookReceiver) SetTracer(t *trace.Tracer) {
+	if w != nil {
+		w.tracer = t
+	}
 }
 
 // NewWebhook is the legacy constructor (no auth). Kept for backwards
@@ -120,6 +131,14 @@ func (w *WebhookReceiver) Start(ctx context.Context, wg *sync.WaitGroup) error {
 				http.Error(rw, "read error", http.StatusBadRequest)
 				return
 			}
+			// Trace capture. Reads happen-once - we already have body in memory.
+			// nil-safe (no-op when tracer is nil).
+			srcIPForTrace := r.RemoteAddr
+			if h, _, splitErr := net.SplitHostPort(r.RemoteAddr); splitErr == nil {
+				srcIPForTrace = h
+			}
+			w.tracer.CaptureWebhook(r.Method, r.URL.Path, srcIPForTrace, r.Header, body)
+
 			defer r.Body.Close()
 
 			ev := event.New("webhook:"+ep.Profile, body)
