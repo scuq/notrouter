@@ -40,6 +40,20 @@ receivers:
         # on first hit. After the first 10-min summary, re-order by hit
         # count so the cheapest patterns short-circuit early.
         - "Failed login"
+  smtp:
+    port_25:
+      enabled: true
+      listen: ":2525"
+      hostname: "notrouter.local"
+      allowed_ips:
+        - "127.0.0.1/32"        # loopback
+        - "172.16.0.0/12"       # private range
+        - "10.0.0.0/8"          # private range
+        - "192.168.0.0/16"      # private range
+      allowed_rcpt_to:
+        - "alerts@notrouter.local"
+      allowed_from: []
+      max_message_bytes: 1048576
 
 profiles:
   nagios:
@@ -67,6 +81,29 @@ profiles:
   generic:
     entity:
       from_json: "$.entity"
+
+  smtp_generic:
+    entity:
+      from_field: "from_address"
+    normalize:
+      topic: "smtp"
+      urgency:
+        from_field: "urgency_default"
+    attributes:
+      msg:
+        from_field: "body"
+      subject:
+        from_field: "subject"
+      from_address:
+        from_field: "from_address"
+      to_address:
+        from_field: "to_address"
+      message_id:
+        from_field: "message_id"
+      received_from_ip:
+        from_field: "received_from_ip"
+      source_kind:
+        static: "smtp"
 
 dedup:
   ttl: 5m
@@ -98,12 +135,27 @@ plugin_instances:
       path: /var/log/notrouter/audit.jsonl
 
 groups:
-  noc-team:
-    subscribers: [webex_noc, file_audit]
+  audit-only:
+    subscribers: [file_audit]
+  webex-channel:
+    subscribers: [webex_noc]
 
 routing:
+  # Everyone gets audited regardless of source
   - match: {}
-    groups: [noc-team]
+    groups: [audit-only]
+
+  # Only nagios-* topics get sent to Webex (matches your existing nagios profile output)
+  - match:
+      topic:
+        - "nagios-host-down"
+        - "nagios-host-up"
+        - "nagios-host-unreachable"
+        - "nagios-service-ok"
+        - "nagios-service-warning"
+        - "nagios-service-critical"
+        - "nagios-service-unknown"
+    groups: [webex-channel]
 
 dispatch:
   global_delivery_ttl: 30m

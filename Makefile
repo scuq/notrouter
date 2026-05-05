@@ -256,3 +256,44 @@ dev-docker-clean: _dev-docker-preflight ## DESTRUCTIVE: stop and remove volumes
 .PHONY: dev-logs
 dev-logs: _dev-docker-preflight ## tail logs of the running container (no recreate)
 	$(CONTAINER_CMD) -f $(DEV_COMPOSE) logs -f $(DEV_SERVICE)
+
+# v0.3.0 SMTP smoke test. Sends a synthetic email to localhost:2525
+# using stdlib python smtplib. Requires:
+#   - notrouter running with receivers.smtp.port_25.enabled = true
+#   - listen: ":2525" in the SMTP config
+#   - localhost in the allowed_ips list (e.g. "127.0.0.1/32")
+#   - "alerts@notrouter.local" in allowed_rcpt_to
+.PHONY: smoke-smtp
+smoke-smtp:
+	@command -v python3 >/dev/null || (echo "python3 required for smoke-smtp"; exit 1)
+	@python3 -c '\
+import smtplib; \
+from email.message import EmailMessage; \
+msg = EmailMessage(); \
+msg["From"] = "smoke-test@local"; \
+msg["To"] = "alerts@notrouter.local"; \
+msg["Subject"] = "smoke test from python smtplib"; \
+msg.set_content("This is a smoke test body sent via stdlib smtplib.\nLine two.\nLine three."); \
+s = smtplib.SMTP("localhost", 2525, timeout=5); \
+s.send_message(msg); \
+s.quit(); \
+print("sent OK to localhost:2525")'
+
+# Multipart variant - sends an HTML+plaintext email like real monitoring
+# tools would. Tests the MIME walker in smtp_parse.go.
+.PHONY: smoke-smtp-multipart
+smoke-smtp-multipart:
+	@command -v python3 >/dev/null || (echo "python3 required for smoke-smtp-multipart"; exit 1)
+	@python3 -c '\
+import smtplib; \
+from email.message import EmailMessage; \
+msg = EmailMessage(); \
+msg["From"] = "checkmk@example.com"; \
+msg["To"] = "alerts@notrouter.local"; \
+msg["Subject"] = "PROBLEM: Service Filesystem /var WARNING"; \
+msg.set_content("Plain text version: filesystem /var is at 89% used.\nThis is the plain part."); \
+msg.add_alternative("<html><body><h1>Filesystem WARNING</h1><p>/var is at <b>89%</b> used.</p></body></html>", subtype="html"); \
+s = smtplib.SMTP("localhost", 2525, timeout=5); \
+s.send_message(msg); \
+s.quit(); \
+print("sent multipart OK")'

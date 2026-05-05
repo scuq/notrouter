@@ -79,6 +79,7 @@ type AdminAuth struct {
 type ReceiversConfig struct {
 	Webhook WebhookReceiverConfig `yaml:"webhook"`
 	Syslog  SyslogReceiverConfig  `yaml:"syslog"`
+	SMTP    SMTPReceiverConfig    `yaml:"smtp"`
 }
 
 type WebhookReceiverConfig struct {
@@ -117,6 +118,29 @@ type SyslogEarlyFilterConfig struct {
 	CaseInsensitive bool          `yaml:"case_insensitive"`
 	LogInterval     time.Duration `yaml:"log_interval"`
 	IncludePatterns []string      `yaml:"include_patterns"`
+}
+
+// SMTPReceiverConfig holds the SMTP receiver's per-port configurations.
+// v0.3.0 ships port 25 only. Port 587 (authenticated submission) lands
+// in v0.3.3 and will be a sibling block.
+type SMTPReceiverConfig struct {
+	Port25 SMTPPort25Config `yaml:"port_25"`
+}
+
+// SMTPPort25Config configures the unauthenticated SMTP receiver (port 25
+// or operator-chosen port). Trust comes from network-level filters: IP
+// allowlist via CIDR, RCPT TO exact-match allowlist, and an optional
+// FROM allowlist. Empty IP/RCPT lists are treated as DENY-ALL (caller
+// must explicitly enumerate what's permitted) - typo-protection against
+// accidentally permissive configs.
+type SMTPPort25Config struct {
+	Enabled         bool     `yaml:"enabled"`
+	Listen          string   `yaml:"listen"`            // e.g. ":25" or ":2525"
+	Hostname        string   `yaml:"hostname"`          // banner name; defaults to notrouter.local
+	AllowedIPs      []string `yaml:"allowed_ips"`       // CIDR or bare IP
+	AllowedRcptTo   []string `yaml:"allowed_rcpt_to"`   // exact-match
+	AllowedFrom     []string `yaml:"allowed_from"`      // exact OR @domain suffix; empty = any
+	MaxMessageBytes int      `yaml:"max_message_bytes"` // default 1048576 (1 MiB)
 }
 
 type ProfileConfig struct {

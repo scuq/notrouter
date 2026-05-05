@@ -181,6 +181,25 @@ func (p *Pipeline) Start(parent context.Context) error {
 		closeInstances(p.instances, p.log)
 		return fmt.Errorf("syslog-tcp receiver: %w", err)
 	}
+
+	// SMTP receiver. Disabled by default; only constructed if the config
+	// has receivers.smtp.port_25.enabled = true. NewSMTPReceiver returns
+	// (nil, nil) when disabled, which we skip cleanly.
+	smtp25, err := receivers.NewSMTPReceiver(p.cfg.Receivers.SMTP.Port25, p.pl.RawCh, p.log)
+	if err != nil {
+		p.cancel()
+		p.pl.Wait()
+		closeInstances(p.instances, p.log)
+		return fmt.Errorf("smtp-25 receiver: %w", err)
+	}
+	if smtp25 != nil {
+		if err := smtp25.Start(p.ctx, &p.ioWg); err != nil {
+			p.cancel()
+			p.pl.Wait()
+			closeInstances(p.instances, p.log)
+			return fmt.Errorf("smtp-25 receiver start: %w", err)
+		}
+	}
 	return nil
 }
 
