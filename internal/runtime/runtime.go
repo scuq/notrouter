@@ -22,6 +22,7 @@ import (
 	"github.com/scuq/notrouter/internal/parser"
 	"github.com/scuq/notrouter/internal/pipeline"
 	"github.com/scuq/notrouter/internal/plugins"
+	"github.com/scuq/notrouter/internal/parsers"
 	"github.com/scuq/notrouter/internal/trace"
 	"github.com/scuq/notrouter/internal/receivers"
 	"github.com/scuq/notrouter/internal/router"
@@ -177,6 +178,16 @@ func (p *Pipeline) Start(parent context.Context) error {
 	}
 	p.tracer = tracer
 
+	// Build mail parser registry. nil if no parsers configured - SMTP
+	// receiver's Dispatch is nil-safe and falls back to smtp_generic.
+	parserRegistry, err := parsers.NewRegistry(p.cfg.MailParsers, p.log)
+	if err != nil {
+		p.cancel()
+		p.pl.Wait()
+		closeInstances(p.instances, p.log)
+		return fmt.Errorf("mail parsers: %w", err)
+	}
+
 	// Build the syslog early-drop filter from config (if enabled).
 	// Nil filter means "pass everything", which is the legacy behavior.
 	p.syslogFilter = receivers.NewSyslogFilter(p.cfg.Receivers.Syslog.EarlyFilter, p.log)
@@ -207,6 +218,7 @@ func (p *Pipeline) Start(parent context.Context) error {
 	smtp25, err := receivers.NewSMTPReceiver(p.cfg.Receivers.SMTP.Port25, p.pl.RawCh, p.log)
 	if smtp25 != nil {
 		smtp25.SetTracer(p.tracer)
+		smtp25.SetParsers(parserRegistry)
 	}
 	if err != nil {
 		p.cancel()

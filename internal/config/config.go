@@ -25,6 +25,7 @@ type Config struct {
 	Dispatch        DispatchConfig            `yaml:"dispatch"`
 	Pipeline        PipelineConfig            `yaml:"pipeline"`
 	Trace           TraceConfig               `yaml:"trace,omitempty"`
+	MailParsers     []ParserConfig            `yaml:"mail_parsers,omitempty"`
 	Links           map[string]string         `yaml:"links"`
 
 	// path and loadedHash are populated by Load(). Not YAML-tagged so they
@@ -178,6 +179,50 @@ type TraceAppendConfig struct {
 	Enabled         bool  `yaml:"enabled"`
 	MaxBytesPerFile int64 `yaml:"max_bytes_per_file"` // default 10 MiB
 	MaxFiles        int   `yaml:"max_files"`          // default 3
+}
+
+// ParserConfig defines a single mail parser. Operators define one entry
+// per vendor (CheckMK, Grafana, etc.). Parsers run in YAML order; first
+// match wins. If no parser matches, the SMTP receiver falls back to the
+// smtp_generic profile.
+type ParserConfig struct {
+	Name    string             `yaml:"name"`
+	Match   ParserMatchConfig  `yaml:"match"`
+	Profile string             `yaml:"profile"`
+	Extract []ExtractorConfig  `yaml:"extract"`
+}
+
+// ParserMatchConfig holds the conditions under which a parser handles
+// an event. Conditions AND together; an empty condition is ignored.
+// At least one condition must be set or the parser would match every
+// event (and shadow other parsers).
+type ParserMatchConfig struct {
+	SubjectPrefix  string `yaml:"subject_prefix,omitempty"`
+	RcptToContains string `yaml:"rcpt_to_contains,omitempty"`
+}
+
+// ExtractorConfig is the polymorphic shape for parser extractors. The
+// Type field discriminates; only the relevant fields are read for each
+// type. Validation happens at parser-load time.
+//
+// Available types:
+//   from_subject_regex       - regex on subject (Pattern)
+//   from_attribute_regex     - regex on existing attr (Source, Pattern)
+//   from_body_kvline         - "Label: value" line (Label, Attribute)
+//   from_body_after_label    - everything after "Label:" (Label, Attribute)
+//   from_header              - email header (Header, Attribute)
+//   from_template            - Go template render (Template, Attribute)
+//   dispatch_first_match     - try alternatives in order (Alternatives)
+type ExtractorConfig struct {
+	Type string `yaml:"type"`
+
+	Label        string             `yaml:"label,omitempty"`
+	Attribute    string             `yaml:"attribute,omitempty"`
+	Pattern      string             `yaml:"pattern,omitempty"`
+	Source       string             `yaml:"source,omitempty"`
+	Template     string             `yaml:"template,omitempty"`
+	Header       string             `yaml:"header,omitempty"`
+	Alternatives []ExtractorConfig  `yaml:"alternatives,omitempty"`
 }
 
 type ProfileConfig struct {

@@ -18,6 +18,7 @@ import (
 	"github.com/scuq/notrouter/internal/event"
 	"github.com/scuq/notrouter/internal/metrics"
 	"github.com/scuq/notrouter/internal/pipeline"
+	"github.com/scuq/notrouter/internal/parsers"
 	"github.com/scuq/notrouter/internal/trace"
 )
 
@@ -61,6 +62,10 @@ type SMTPReceiver struct {
 	// Optional tracer for debug capture. Set via SetTracer() after
 	// construction. nil means trace disabled (zero overhead).
 	tracer *trace.Tracer
+
+	// Optional parser registry. Set via SetParsers() after construction.
+	// nil means no parsers; all events fall back to smtp_generic profile.
+	parsers *parsers.Registry
 }
 
 // SetTracer wires in an optional trace.Tracer after construction. nil
@@ -69,6 +74,15 @@ type SMTPReceiver struct {
 func (r *SMTPReceiver) SetTracer(t *trace.Tracer) {
 	if r != nil {
 		r.tracer = t
+	}
+}
+
+// SetParsers wires in an optional parser registry. nil means no parsers
+// configured - all SMTP events fall through to smtp_generic profile.
+// Safe to call before Start().
+func (r *SMTPReceiver) SetParsers(p *parsers.Registry) {
+	if r != nil {
+		r.parsers = p
 	}
 }
 
@@ -352,11 +366,14 @@ func (s *smtpSession) Data(r io.Reader) error {
 		"size_bytes", len(body),
 		"remote_ip", s.remoteIP)
 
-	// Use the same profile name pattern as other receivers - "smtp"
-	// matches the smtp_generic profile in the default config. Per-
-	// vendor parsers in v0.3.1 will route based on RCPT TO.
+	// Dispatch via parser registry. If a parser matches, it sets
+	// vendor-specific attributes on ev and returns the profile name
+	// (e.g. "checkmk"). If no parser matches OR a parser fails, we
+	// fall back to "smtp_generic" - the event still flows through.
+	profileName := s.recv.parsers.Dispatch(ev)
+
 	select {
-	case s.recv.rawCh <- &pipeline.RawEvent{Profile: "smtp_generic", Event: ev}:
+	case s.recv.rawCh <- &pipeline.RawEvent{Profile: profileName, Event: ev}:
 		return nil
 	default:
 		// Pipeline is congested. Return a temporary failure so the

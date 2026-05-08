@@ -55,7 +55,6 @@ receivers:
       allowed_from: []
       max_message_bytes: 1048576
 
-
 trace:
   enabled: true
   output_dir: /var/log/notrouter/trace
@@ -76,6 +75,78 @@ trace:
       enabled: false
       max_bytes_per_file: 10485760
       max_files: 3
+
+# mail_parsers defines vendor-specific parsing for inbound SMTP events.
+# Each parser:
+#   - has a Match condition (subject_prefix is the strongest discriminator)
+#   - runs a sequence of extractors on a matched event
+#   - returns a profile name; the matched profile's normalize/attributes
+#     rules apply downstream
+#
+# Order matters: parsers are tried top-down, first match wins. If no
+# parser matches, events fall back to the smtp_generic profile.
+mail_parsers:
+  - name: checkmk
+    match:
+      subject_prefix: "Check_MK: "
+    profile: checkmk
+    extract:
+      # Body labeled fields - Host:, Alias:, Address:, Service:, Event:,
+      # Output:, Perfdata:. Service: is absent for host-level events;
+      # missing labels just produce empty attributes (no error).
+      - type: from_body_kvline
+        label: "Host"
+        attribute: host
+      - type: from_body_kvline
+        label: "Alias"
+        attribute: alias
+      - type: from_body_kvline
+        label: "Address"
+        attribute: address
+      - type: from_body_kvline
+        label: "Service"
+        attribute: service
+      - type: from_body_kvline
+        label: "Event"
+        attribute: event_raw
+      - type: from_body_kvline
+        label: "Output"
+        attribute: output
+      - type: from_body_after_label
+        label: "Perfdata"
+        attribute: perfdata
+
+      # Email headers
+      - type: from_header
+        header: "Message-Id"
+        attribute: message_id
+      - type: from_header
+        header: "Date"
+        attribute: email_date
+
+      # Dispatch on the Event field. Two formats observed:
+      #   Path A: "OK -> CRIT"           (state transition)
+      #   Path B: "Acknowledged (CRIT)"  (lifecycle event)
+      # First-match-wins; only one alternative will populate captures.
+      - type: dispatch_first_match
+        alternatives:
+          - type: from_attribute_regex
+            source: event_raw
+            pattern: '^(?P<previous_state>\w+)\s+->\s+(?P<state>\w+)\s*$'
+          - type: from_attribute_regex
+            source: event_raw
+            pattern: '^(?P<event_kind>.+?)\s+\((?P<state>\w+)\)\s*$'
+
+      # Computed: type (service or host) - presence of Service: line.
+      - type: from_template
+        attribute: type
+        template: '{{ if .service }}service{{ else }}host{{ end }}'
+
+      # Computed: notiftype - mirrors the values the existing Webex
+      # template branches on (PROBLEM, RECOVERY, ACKNOWLEDGEMENT, etc).
+      - type: from_template
+        attribute: notiftype
+        template: '{{ if .event_kind }}{{ if eq .event_kind "Acknowledged" }}ACKNOWLEDGEMENT{{ else if eq .event_kind "Downtime Start" }}DOWNTIMESTART{{ else if eq .event_kind "Downtime End" }}DOWNTIMEEND{{ else if eq .event_kind "Flapping Start" }}FLAPPINGSTART{{ else if eq .event_kind "Flapping Stop" }}FLAPPINGSTOP{{ else }}{{ .event_kind | upper }}{{ end }}{{ else if or (eq .state "OK") (eq .state "UP") }}RECOVERY{{ else }}PROBLEM{{ end }}'
 
 profiles:
   nagios:
@@ -127,6 +198,45 @@ profiles:
       source_kind:
         static: "smtp"
 
+  # checkmk - structured profile for events parsed from CheckMK email
+  # notifications. Driven by the mail_parsers.checkmk parser config above.
+  # Produces well-shaped events compatible with the Webex template's
+  # notiftype branching (PROBLEM, RECOVERY, ACKNOWLEDGEMENT, etc.).
+  checkmk:
+    entity:
+      from_field: "host"
+    normalize:
+      topic: "checkmk-{{.Attributes.type}}-{{.Attributes.state | lower}}"
+      urgency:
+        from_field: "state"
+        map:
+          OK: info
+          UP: info
+          WARN: medium
+          CRIT: critical
+          DOWN: high
+          UNREACHABLE: high
+          UNKNOWN: low
+    attributes:
+      msg:
+        from_field: "output"
+      service:
+        from_field: "service"
+      state:
+        from_field: "state"
+      previous_state:
+        from_field: "previous_state"
+      type:
+        from_field: "type"
+      notiftype:
+        from_field: "notiftype"
+      perfdata:
+        from_field: "perfdata"
+      address:
+        from_field: "address"
+      source_kind:
+        static: "checkmk"
+
 dedup:
   ttl: 5m
   key_fields: [entity, topic]
@@ -167,9 +277,14 @@ routing:
   - match: {}
     groups: [audit-only]
 
-  # Only nagios-* topics get sent to Webex (matches your existing nagios profile output)
+  # Webex destinations - whitelist topics that produce well-shaped events.
+  # CheckMK topics added in v0.3.1 once the parser produces structured
+  # events. SMTP fallback (topic=smtp) intentionally NOT in this list -
+  # those events are unstructured and won't render well via the Webex
+  # template.
   - match:
       topic:
+        # nagios webhook events
         - "nagios-host-down"
         - "nagios-host-up"
         - "nagios-host-unreachable"
@@ -177,6 +292,21 @@ routing:
         - "nagios-service-warning"
         - "nagios-service-critical"
         - "nagios-service-unknown"
+        # checkmk SMTP events (parsed via mail_parsers.checkmk)
+        - "checkmk-service-ok"
+        - "checkmk-service-warn"
+        - "checkmk-service-crit"
+        - "checkmk-service-unknown"
+        - "checkmk-host-up"
+        - "checkmk-host-down"
+        - "checkmk-host-unreachable"
+        # checkmk lifecycle events (acknowledgement, downtime)
+        # Topic format for ACK/DOWNTIME uses the state-in-parens as the
+        # state attribute, so e.g. ACK on a CRIT service produces:
+        #   topic = "checkmk-service-crit"
+        # Already covered above. Same applies to Downtime Start/End -
+        # they emit topics matching their current state, not separate
+        # acknowledgement-* or downtime-* topics.
     groups: [webex-channel]
 
 dispatch:
@@ -191,34 +321,3 @@ pipeline:
   instance_buffer_size: 1024
   resolver_workers: 4
   normalizer_workers: 4
-
-# trace - DEBUG ONLY. Captures raw incoming receiver data to disk for
-# inspection. Default disabled. Per-receiver toggles independent.
-#
-# WHEN ENABLED: performance is impacted, sensitive data is written to
-# disk in cleartext (auth headers, alert details, etc.), and operators
-# get periodic reminders to disable.
-#
-# Output dir is created with 0700 perms; files with 0600. Best practice:
-# mount a separate volume for trace output and exclude from backups.
-#
-# trace:
-#   enabled: true
-#   output_dir: /var/log/notrouter/trace
-#   reminder_interval: 1h
-#   receivers:
-#     smtp:
-#       enabled: true
-#       max_files: 50              # one .eml per message; oldest deleted at limit
-#     syslog_udp:
-#       enabled: false
-#       max_bytes_per_file: 10485760    # 10 MiB
-#       max_files: 3
-#     syslog_tcp:
-#       enabled: false
-#       max_bytes_per_file: 10485760
-#       max_files: 3
-#     webhook:
-#       enabled: false
-#       max_bytes_per_file: 10485760
-#       max_files: 3
