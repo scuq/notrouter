@@ -243,8 +243,9 @@ type NormalizeConfig struct {
 }
 
 type UrgencyMapping struct {
-	FromJSON string            `yaml:"from_json"`
-	Map      map[string]string `yaml:"map"`
+	FromJSON  string            `yaml:"from_json,omitempty"`
+	FromField string            `yaml:"from_field,omitempty"`
+	Map       map[string]string `yaml:"map"`
 }
 
 type AttributeExtractor struct {

@@ -47,6 +47,7 @@ var templateFuncs = template.FuncMap{
 type compiledNormalize struct {
 	topicTpl    *template.Template
 	urgencyJSON string
+	urgencyField   string
 	urgencyMap  map[string]event.Urgency
 	attributes  map[string]config.AttributeExtractor
 }
@@ -70,6 +71,7 @@ func NewNormalizer(
 	for name, pc := range profileCfgs {
 		cn := &compiledNormalize{
 			urgencyJSON: pc.Normalize.Urgency.FromJSON,
+		urgencyField:    pc.Normalize.Urgency.FromField,
 			urgencyMap:  make(map[string]event.Urgency, len(pc.Normalize.Urgency.Map)),
 			attributes:  pc.Attributes,
 		}
@@ -167,6 +169,19 @@ func (n *Normalizer) normalize(raw *pipeline.RawEvent) {
 
 	if cn != nil && cn.urgencyJSON != "" && jsonVal != nil {
 		if s, ok := jsonpath.GetString(jsonVal, cn.urgencyJSON); ok {
+			if mapped, ok := cn.urgencyMap[strings.ToUpper(s)]; ok {
+				raw.Event.Urgency = mapped
+			}
+		}
+	}
+
+	// urgency.from_field path - read an attribute (set by the receiver
+	// or by a parser) and apply the urgency map. This is what enables
+	// non-JSON event sources (SMTP via parsers, etc.) to drive urgency
+	// based on a state attribute. Without this, urgency.from_field in
+	// YAML is silently ignored and urgency falls back to default=info.
+	if cn != nil && cn.urgencyField != "" && raw.Event.Urgency == "" {
+		if s := raw.Event.Attributes[cn.urgencyField]; s != "" {
 			if mapped, ok := cn.urgencyMap[strings.ToUpper(s)]; ok {
 				raw.Event.Urgency = mapped
 			}
