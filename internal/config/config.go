@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -322,8 +323,12 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := yaml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	if os.Getenv("NOTROUTER_LAX_YAML") == "" {
+		dec.KnownFields(true)
+	}
+	if err := dec.Decode(cfg); err != nil {
+		return nil, fmt.Errorf("parse config (set NOTROUTER_LAX_YAML=1 to allow unknown fields): %w", err)
 	}
 	// Capture-and-clear the deprecated password BEFORE applyDefaults,
 	// so applyDefaults can't accidentally set it to "admin" via the

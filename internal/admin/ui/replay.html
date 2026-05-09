@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>notrouter // replay</title>
+  <link rel="stylesheet" href="/admin/ui/static/style.css">
+  <style>
+    .replay-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
+    .replay-list { max-height: 60vh; overflow-y: auto; border: 1px solid #1ea53a44; padding: 8px; }
+    .replay-row { padding: 6px 8px; cursor: pointer; border-bottom: 1px solid #1ea53a22; font-size: 0.85rem; }
+    .replay-row:hover { background: #1ea53a11; }
+    .replay-row.selected { background: #1ea53a22; outline: 1px solid #00ff41; }
+    .replay-row .ts { color: #00ff4188; font-size: 0.75rem; }
+    .replay-row .topic { color: #00ff41; }
+    .replay-row .entity { color: #fff; }
+    .replay-results { border: 1px solid #1ea53a44; padding: 12px; min-height: 60vh; }
+    .replay-rule { padding: 6px 0; border-bottom: 1px solid #1ea53a22; }
+    .replay-rule.matched { color: #00ff41; }
+    .replay-rule.unmatched { color: #00ff4166; }
+    .replay-rule-marker { display: inline-block; width: 18px; }
+    .replay-meta { font-size: 0.85rem; color: #00ff41cc; }
+    .replay-subscribers { color: #00ff41; font-weight: bold; }
+    .replay-empty { color: #00ff4166; padding: 20px; text-align: center; }
+    .replay-warn { color: #ffb000; }
+    .replay-error { color: #ff4040; }
+    .replay-controls { display: flex; gap: 10px; margin-bottom: 12px; align-items: center; }
+    .replay-controls input { background: #000; border: 1px solid #1ea53a44; color: #00ff41; padding: 4px 8px; }
+  </style>
+</head>
+<body class="app-page">
+  <div class="terminal">
+    <div class="terminal-header">
+      <h1>notrouter // replay</h1>
+      <nav class="nav">
+        <a href="/admin/ui/">overview</a>
+        <a href="/admin/ui/config">config</a>
+        <a href="/admin/ui/logs">logs</a>
+        <a href="/admin/ui/test">test</a>
+        <a href="/admin/ui/replay" class="active">replay</a>
+        <a href="/admin/ui/tokens">tokens</a>
+        <a href="/admin/ui/webhook-keys">webhook keys</a>
+        {{ range $k, $v := .Links }}<a href="{{ $v }}" target="_blank" rel="noopener">{{ $k }}</a>{{ end }}
+        <a href="/admin/ui/change-password">change password</a>
+        <form method="POST" action="/admin/api/logout" style="display:inline; margin:0;">
+          <input type="hidden" name="csrf" value="{{ .CSRF }}">
+          <button type="submit" style="all:unset; cursor:pointer; color:#1ea53a; letter-spacing:1.5px; text-transform:uppercase; font-size:.82rem; text-shadow: 0 0 3px rgba(30, 165, 58, .25);" onmouseover="this.style.color='#00ff41'" onmouseout="this.style.color='#1ea53a'">logout</button>
+        </form>
+      </nav>
+    </div>
+
+    <div class="notice">
+      pick a past event from the audit log on the left, click "analyze" to see
+      which routing rules WOULD match if the event were received now. this is
+      a dry-run - no events are dispatched.
+    </div>
+
+    <div class="replay-controls">
+      <span>filter:</span>
+      <input id="replay-filter" type="text" placeholder="entity, topic, or source" />
+      <button type="button" class="inline-btn" id="replay-refresh">refresh</button>
+      <span id="replay-count" class="replay-meta"></span>
+    </div>
+
+    <div class="replay-grid">
+      <div>
+        <h2>recent events</h2>
+        <div class="replay-list" id="replay-list">
+          <div class="replay-empty">loading...</div>
+        </div>
+      </div>
+
+      <div>
+        <h2>analysis</h2>
+        <div class="replay-results" id="replay-results">
+          <div class="replay-empty">select an event from the list to analyze it</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:20px; font-size:.8rem; color:#00ff4188;">
+      <p><strong>shortcut keys:</strong> click any audit event to analyze it. the analysis
+      shows: which routing rules matched, what subscribers the event would reach,
+      whether dedup or suppression would have intercepted it.</p>
+    </div>
+  </div>
+
+  <script src="/admin/ui/static/replay.js"></script>
+</body>
+</html>

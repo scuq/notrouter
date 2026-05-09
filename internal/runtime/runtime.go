@@ -34,6 +34,8 @@ type Pipeline struct {
 	pl        *pipeline.Pipeline
 	tracker   *dispatch.Tracker
 	dedup     *dedup.Deduplicator
+	suppressor *suppress.Suppressor
+	router     *router.Router
 	dispatch  *dispatch.Dispatcher
 	instances map[string]plugins.Instance
 
@@ -131,6 +133,8 @@ func Build(cfg *config.Config, log *slog.Logger, webhookVerifier receivers.Webho
 		pl:              pl,
 		tracker:         tracker,
 		dedup:           deduper,
+		suppressor:      suppr,
+		router:          rtr,
 		dispatch:        dsp,
 		instances:       instances,
 		log:             log,
@@ -300,4 +304,21 @@ func closeInstances(instances map[string]plugins.Instance, log *slog.Logger) {
 			}
 		}
 	}
+}
+
+// Router returns the live router for read-only use by the analyzer.
+// Lifetime ends when the pipeline stops.
+func (p *Pipeline) Router() *router.Router {
+	return p.router
+}
+
+// Suppressor returns the live suppressor for read-only use by the
+// analyzer.
+func (p *Pipeline) Suppressor() *suppress.Suppressor {
+	return p.suppressor
+}
+
+// Dedup returns the live dedup for read-only use by the analyzer.
+func (p *Pipeline) Dedup() *dedup.Deduplicator {
+	return p.dedup
 }

@@ -130,3 +130,24 @@ func (d *Deduplicator) sweep() {
 		}
 	}
 }
+
+// AnalyzeKey returns the dedup key for an event AND reports whether the
+// key currently exists in the seen-cache. READ-ONLY: does NOT add to
+// the cache. Used by the analyzer for "what would dedup do" queries.
+//
+// Returns (key, isDup, lastSeenAt). lastSeenAt is meaningful only when
+// isDup is true.
+func (d *Deduplicator) AnalyzeKey(ev *event.Event) (string, bool, time.Time) {
+	key := d.key(ev)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	exp, ok := d.seen[key]
+	if !ok {
+		return key, false, time.Time{}
+	}
+	now := time.Now()
+	if now.Before(exp) {
+		return key, true, exp.Add(-d.ttl)
+	}
+	return key, false, time.Time{}
+}

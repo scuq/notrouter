@@ -45,6 +45,12 @@ type Server struct {
 
 	rtMu sync.RWMutex
 	rt   reloaderAccessor
+
+	// Optional analyzer + audit reader. Set via SetAnalyzer at startup.
+	// nil-safe: the /admin/api/audit and /admin/api/routing/analyze
+	// endpoints return 503 if either is missing.
+	auditReader auditAccessor
+	analyzer    analysisAccessor
 }
 
 func NewWithUI(
@@ -91,6 +97,8 @@ func (s *Server) Start(ctx context.Context, wg *sync.WaitGroup) error {
 	mux.Handle("/admin/state", authed)
 	mux.Handle("/admin/deliveries", authed)
 	mux.Handle("/admin/dedup/clear", authed)
+	mux.Handle("/admin/api/audit/recent", authed)
+	mux.Handle("/admin/api/routing/analyze", authed)
 	mux.Handle("/admin/", authed)
 
 	mux.Handle("/", s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +219,10 @@ func (s *Server) handleLegacyMux(w http.ResponseWriter, r *http.Request) {
 		s.handleDedupClear(w, r)
 	case "/admin/":
 		s.handleAdminIndex(w, r)
+	case "/admin/api/audit/recent":
+		s.handleAuditRecent(w, r)
+	case "/admin/api/routing/analyze":
+		s.handleRoutingAnalyze(w, r)
 	default:
 		http.NotFound(w, r)
 	}

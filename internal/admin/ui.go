@@ -55,6 +55,7 @@ type uiHandler struct {
 	tmplTest     *template.Template
 	tmplTokens   *template.Template
 	tmplWebhookKeys *template.Template
+	tmplReplay   *template.Template
 	staticFS     http.FileSystem
 	store        *SessionStore
 	creds        credsAccessor
@@ -140,6 +141,10 @@ func newUIHandler(
 	if err != nil {
 		return nil, err
 	}
+	replayTpl, err := template.ParseFS(uiFS, "ui/replay.html")
+	if err != nil {
+		return nil, err
+	}
 	wkTpl, err := template.ParseFS(uiFS, "ui/webhook_keys.html")
 	if err != nil {
 		return nil, err
@@ -157,6 +162,7 @@ func newUIHandler(
 		tmplTest:     testTpl,
 		tmplTokens:   tokensTpl,
 		tmplWebhookKeys: wkTpl,
+		tmplReplay:   replayTpl,
 		staticFS:     http.FS(staticSub),
 		store:        store,
 		creds:        creds,
@@ -176,6 +182,7 @@ func (h *uiHandler) register(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/ui/config", h.requireAuth(h.handleConfigPage))
 	mux.HandleFunc("/admin/ui/logs", h.requireAuth(h.handleLogsPage))
 	mux.HandleFunc("/admin/ui/test", h.requireAuth(h.handleTestPage))
+	mux.HandleFunc("/admin/ui/replay", h.requireAuth(h.handleReplayPage))
 	mux.HandleFunc("/admin/ui/tokens", h.requireAuth(h.handleTokensPage))
 	mux.HandleFunc("/admin/ui/", h.requireAuth(h.handleDashboard))
 	mux.HandleFunc("/admin/ui", func(w http.ResponseWriter, r *http.Request) {
@@ -1122,3 +1129,20 @@ func (h *uiHandler) renderTemplate(w http.ResponseWriter, t *template.Template, 
 		h.log.Error("template render", "err", err)
 	}
 }
+
+// handleReplayPage renders the replay UI - audit log browser + analyzer
+// front-end. The page itself is mostly static; data is fetched via
+// /admin/api/audit/recent and /admin/api/routing/analyze.
+func (h *uiHandler) handleReplayPage(w http.ResponseWriter, r *http.Request) {
+	user := r.Header.Get("X-Notrouter-User")
+	_, csrf, _ := h.store.Get(readSessionCookie(r))
+	h.writeCSRFCookie(w, r, csrf)
+	h.renderTemplate(w, h.tmplReplay, map[string]interface{}{
+		"User":    user,
+		"CSRF":    csrf,
+		"Version": version.Version,
+		"Commit":  version.Commit,
+		"Links":   h.currentCfg().Links,
+	})
+}
+

@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"strings"
 	"fmt"
 	"net"
 	"regexp"
@@ -107,3 +108,42 @@ func (p *Predicate) Matches(ev *event.Event, now time.Time) bool {
 	}
 	return true
 }
+
+// Describe returns a short human-readable summary of the predicate's
+// match conditions. Used by the analyzer for UI labels. Best-effort -
+// not a stable serialization format.
+func (p *Predicate) Describe() string {
+	parts := make([]string, 0, 4)
+	if p.entityRegex != nil {
+		parts = append(parts, "entity_regex="+p.entityRegex.String())
+	}
+	if len(p.topics) > 0 {
+		topicNames := make([]string, 0, len(p.topics))
+		for t := range p.topics {
+			topicNames = append(topicNames, t)
+		}
+		parts = append(parts, "topic in ["+strings.Join(topicNames, ", ")+"]")
+	}
+	if len(p.urgencies) > 0 {
+		uNames := make([]string, 0, len(p.urgencies))
+		for u := range p.urgencies {
+			uNames = append(uNames, string(u))
+		}
+		parts = append(parts, "urgency in ["+strings.Join(uNames, ", ")+"]")
+	}
+	if len(p.attributes) > 0 {
+		attrParts := make([]string, 0, len(p.attributes))
+		for k, v := range p.attributes {
+			attrParts = append(attrParts, k+"="+v)
+		}
+		parts = append(parts, "attrs("+strings.Join(attrParts, ",")+")")
+	}
+	if len(p.entityIPNets) > 0 {
+		parts = append(parts, fmt.Sprintf("entity_ip_in (%d nets)", len(p.entityIPNets)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " AND ")
+}
+

@@ -1,6 +1,8 @@
 package router
 
 import (
+	"time"
+	"strings"
 	"context"
 	"log/slog"
 	"sync"
@@ -93,3 +95,64 @@ func (r *Router) resolve(ev *event.Event) []string {
 	}
 	return out
 }
+
+// RuleAnalysisResult is the per-rule outcome of routing analysis.
+// Returned in evaluation order (same order as the YAML config).
+type RuleAnalysisResult struct {
+	Description string
+	Matched     bool
+	GroupsAdded []string
+}
+
+// AnalyzeRouting runs the routing matcher in dry-run mode and returns
+// per-rule decisions plus the resolved groups-to-subscribers map.
+// Read-only: does not enqueue or dispatch the event.
+func (r *Router) AnalyzeRouting(ev *event.Event) ([]RuleAnalysisResult, map[string][]string) {
+	results := make([]RuleAnalysisResult, len(r.rules))
+	matchedGroups := make(map[string]struct{})
+	now := ev.Timestamp
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	for i, rule := range r.rules {
+		matched := rule.predicate.Matches(ev, now)
+		desc := describePredicate(rule.predicate, rule.groups)
+		results[i] = RuleAnalysisResult{
+			Description: desc,
+			Matched:     matched,
+		}
+		if matched {
+			results[i].GroupsAdded = append([]string(nil), rule.groups...)
+			for _, g := range rule.groups {
+				matchedGroups[g] = struct{}{}
+			}
+		}
+	}
+
+	groupsResolved := make(map[string][]string, len(matchedGroups))
+	for g := range matchedGroups {
+		gc, ok := r.groups[g]
+		if !ok {
+			groupsResolved[g] = nil
+			continue
+		}
+		groupsResolved[g] = append([]string(nil), gc.Subscribers...)
+	}
+
+	return results, groupsResolved
+}
+
+// describePredicate produces a human-readable summary for the analyzer.
+// Best-effort - not a stable serialization format.
+func describePredicate(p *pipeline.Predicate, groups []string) string {
+	desc := p.Describe()
+	if desc == "" {
+		desc = "(catch-all)"
+	}
+	if len(groups) > 0 {
+		return desc + " -> [" + strings.Join(groups, ", ") + "]"
+	}
+	return desc
+}
+

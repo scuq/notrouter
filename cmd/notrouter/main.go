@@ -10,6 +10,8 @@ import (
 	"syscall"
 
 	"github.com/scuq/notrouter/internal/admin"
+	"github.com/scuq/notrouter/internal/analyzer"
+	"github.com/scuq/notrouter/internal/event"
 	"github.com/scuq/notrouter/internal/admin/creds"
 	"github.com/scuq/notrouter/internal/config"
 	"github.com/scuq/notrouter/internal/logging"
@@ -112,6 +114,16 @@ func run(configPath string) error {
 		return fmt.Errorf("build admin: %w", err)
 	}
 
+	// v0.3.2: wire the analyzer + audit reader for the replay UI.
+	// Audit path matches the file_audit plugin's default. The analyzer
+	// is reloader-aware: each request resolves the live pipeline so
+	// post-reload pipeline swaps are picked up automatically (same
+	// pattern as Probes).
+	auditPath := "/var/log/notrouter/audit.jsonl"
+	ar := analyzer.NewAuditReader(auditPath)
+	an := &liveAnalyzer{reloader: reloader}
+	adm.SetAnalyzer(ar, an)
+
 	var adminWg sync.WaitGroup
 	if err := adm.Start(parentCtx, &adminWg); err != nil {
 		initial.Stop()
@@ -129,4 +141,17 @@ func run(configPath string) error {
 
 	log.Info("shutdown complete")
 	return nil
+}
+
+// liveAnalyzer adapts the reloader to admin.analysisAccessor. Each
+// Analyze() call resolves the current Pipeline so post-reload swaps
+// are picked up. Lifetime matches the reloader's lifetime.
+type liveAnalyzer struct {
+	reloader *runtime.Reloader
+}
+
+func (l *liveAnalyzer) Analyze(ev *event.Event) analyzer.AnalysisResult {
+	pl := l.reloader.Current()
+	a := analyzer.New(pl.Router(), pl.Suppressor(), pl.Dedup())
+	return a.Analyze(ev)
 }

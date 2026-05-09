@@ -103,3 +103,15 @@ func (s *Suppressor) maybeLog(rule string, ev *event.Event) {
 		"topic", ev.Topic,
 		"urgency", ev.Urgency)
 }
+
+// AnalyzeMatch returns the index of the first suppressor rule that
+// matches the given event, or (-1, "") if none match. READ-ONLY: does
+// not log or rate-limit anything. Used by the analyzer.
+func (s *Suppressor) AnalyzeMatch(ev *event.Event, now time.Time) (int, string) {
+	for i, r := range s.rules {
+		if r.predicate.Matches(ev, now) {
+			return i, r.name
+		}
+	}
+	return -1, ""
+}
