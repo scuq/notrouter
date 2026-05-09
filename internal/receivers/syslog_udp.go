@@ -92,6 +92,7 @@ func (s *SyslogUDPReceiver) Start(ctx context.Context, wg *sync.WaitGroup) error
 			if udpAddr, ok := addr.(*net.UDPAddr); ok {
 				ev.EntityIP = udpAddr.IP
 				ev.Attributes["src_ip"] = udpAddr.IP.String()
+				ev.Attributes["origin_id"] = udpAddr.IP.String()
 			}
 
 			metrics.EventsReceived.WithLabelValues("syslog-udp").Inc()

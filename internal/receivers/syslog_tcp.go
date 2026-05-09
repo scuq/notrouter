@@ -135,6 +135,7 @@ func (s *SyslogTCPReceiver) handleConn(ctx context.Context, wg *sync.WaitGroup, 
 		if remoteIP != nil {
 			ev.EntityIP = remoteIP
 			ev.Attributes["src_ip"] = remoteIP.String()
+			ev.Attributes["origin_id"] = remoteIP.String()
 		}
 		metrics.EventsReceived.WithLabelValues("syslog-tcp").Inc()
 

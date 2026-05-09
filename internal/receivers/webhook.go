@@ -145,6 +145,13 @@ func (w *WebhookReceiver) Start(ctx context.Context, wg *sync.WaitGroup) error {
 			ev.Attributes["http_method"] = r.Method
 			ev.Attributes["http_path"] = r.URL.Path
 			ev.Attributes["http_remote"] = r.RemoteAddr
+			// origin_id - stable across-receiver identifier for the sender.
+			// Uses IP only (no port); port varies per request but IP doesn't.
+			originID := r.RemoteAddr
+			if h, _, splitErr := net.SplitHostPort(r.RemoteAddr); splitErr == nil {
+				originID = h
+			}
+			ev.Attributes["origin_id"] = originID
 
 			metrics.EventsReceived.WithLabelValues("webhook:" + ep.Profile).Inc()
 

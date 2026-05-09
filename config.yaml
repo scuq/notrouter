@@ -168,6 +168,16 @@ profiles:
         from_json: "$.output"
       service:
         from_json: "$.service"
+      state:
+        from_json: "$.state"
+      type:
+        from_json: "$.type"
+      notiftype:
+        from_json: "$.notificationtype"
+      author:
+        from_json: "$.notificationauthor"
+      comment:
+        from_json: "$.notificationcomment"
       source_kind:
         static: "nagios"
 
@@ -236,6 +246,52 @@ profiles:
         from_field: "address"
       source_kind:
         static: "checkmk"
+
+# source_aliases - origin_id -> friendly name map.
+#
+# Each event's origin_id attribute (set by the receiver) is looked up
+# here. If matched, origin_alias is set to the friendly value, which
+# templates display in preference to the raw origin_id.
+#
+# Find your environment's origin_id values:
+#   docker exec notrouter tail -50 /var/log/notrouter/audit.jsonl | \
+#     python3 -c 'import sys,json; seen=set()
+#     for l in sys.stdin:
+#       e=json.loads(l); o=e.get("attributes",{}).get("origin_id","")
+#       if o and o not in seen:
+#         seen.add(o); print(f"{o:40s} via {e.get(\"source\",\"\")}")'
+#
+# Origin_id formats by receiver type:
+#   - SMTP:    full From: email (e.g. "cmk@2f4aa25ce51e")
+#   - webhook: sender IP, port-stripped (e.g. "10.21.146.46")
+#   - syslog:  sender IP
+source_aliases:
+  # ----- Synthetic test traffic -----
+
+  # Test_all_event_types.py script's synthetic CheckMK emails
+  "cmk@test-checkmk":   "checkmk-test-script"
+
+  # ----- Real CheckMK in docker -----
+
+  # The 2f4aa25ce51e value is the docker container's auto-assigned
+  # hostname. WILL CHANGE when the container is recreated. Update
+  # this when you spin up a new CheckMK container instance.
+  "cmk@2f4aa25ce51e":   "checkmk-dev"
+
+  # ----- Local + container-internal -----
+
+  # Loopback - shows up when curl-ing webhooks from inside the
+  # notrouter container itself (make smoke-* targets, manual tests).
+  "127.0.0.1":          "localhost"
+
+  # Docker default bridge gateway - webhook events from sibling
+  # containers on the default bridge come from this address. If your
+  # compose uses a custom network, the gateway IP will differ.
+  "172.17.0.1":         "docker-bridge"
+
+  # ----- Add as new senders come online -----
+  # "10.21.146.46":     "nagios-prod"
+  # "10.21.146.50":     "syslog-firewall-1"
 
 dedup:
   ttl: 5m

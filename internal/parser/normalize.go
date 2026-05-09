@@ -58,6 +58,7 @@ type Normalizer struct {
 	profiles map[string]*compiledNormalize
 	workers  int
 	log      *slog.Logger
+	sourceAliases map[string]string
 }
 
 func NewNormalizer(
@@ -190,6 +191,17 @@ func (n *Normalizer) normalize(raw *pipeline.RawEvent) {
 	if raw.Event.Urgency == "" {
 		raw.Event.Urgency = defaultUrgency(raw)
 	}
+
+	// v0.3.3: apply source alias. If origin_id has a configured alias,
+	// populate origin_alias attribute. Templates use origin_alias first,
+	// fall back to origin_id when no alias matches.
+	if n.sourceAliases != nil {
+		if oid := raw.Event.Attributes["origin_id"]; oid != "" {
+			if alias, ok := n.sourceAliases[oid]; ok && alias != "" {
+				raw.Event.Attributes["origin_alias"] = alias
+			}
+		}
+	}
 }
 
 func applyAttributeExtractors(extractors map[string]config.AttributeExtractor, jsonVal interface{}, ev *event.Event, log *slog.Logger) {
@@ -260,3 +272,19 @@ func tryDecodeJSON(raw []byte) interface{} {
 	}
 	return v
 }
+
+// SetSourceAliases configures the origin_id -> origin_alias mapping
+// applied during normalization. Call once after NewNormalizer; safe to
+// call again on config reload (replaces the map atomically as far as
+// each event sees - normalize() reads the map ref under the assumption
+// that map replacement is via a single pointer swap, which Go's runtime
+// makes atomic).
+//
+// nil-safe: passing nil disables aliasing.
+func (n *Normalizer) SetSourceAliases(aliases map[string]string) {
+	if n == nil {
+		return
+	}
+	n.sourceAliases = aliases
+}
+

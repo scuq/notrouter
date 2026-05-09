@@ -344,6 +344,7 @@ func (s *smtpSession) Data(r io.Reader) error {
 
 	ev := event.New("smtp-25", body)
 	ev.Attributes["from_address"] = s.from
+	ev.Attributes["origin_id"] = s.from
 	ev.Attributes["to_address"] = strings.Join(s.to, ",")
 	ev.Attributes["subject"] = parsed.subject
 	ev.Attributes["body"] = parsed.bodyText

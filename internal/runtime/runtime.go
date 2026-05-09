@@ -97,6 +97,9 @@ func Build(cfg *config.Config, log *slog.Logger, webhookVerifier receivers.Webho
 		closeInstances(instances, log)
 		return nil, fmt.Errorf("normalizer: %w", err)
 	}
+	if normalizer != nil {
+		normalizer.SetSourceAliases(cfg.SourceAliases)
+	}
 	deduper := dedup.New(pl.NormalCh, dedupedCh, cfg.Dedup.TTL, cfg.Dedup.KeyFields, log)
 	suppr, err := suppress.New(dedupedCh, suppressedCh, cfg.Suppressors, cfg.Logging.SuppressorLogThrottle, log)
 	if err != nil {

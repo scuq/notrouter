@@ -27,6 +27,7 @@ type Config struct {
 	Pipeline        PipelineConfig            `yaml:"pipeline"`
 	Trace           TraceConfig               `yaml:"trace,omitempty"`
 	MailParsers     []ParserConfig            `yaml:"mail_parsers,omitempty"`
+	SourceAliases   map[string]string         `yaml:"source_aliases,omitempty"`
 	Links           map[string]string         `yaml:"links"`
 
 	// path and loadedHash are populated by Load(). Not YAML-tagged so they
