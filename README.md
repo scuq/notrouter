@@ -1,5 +1,7 @@
 # notrouter
 
+![screenshot1](screenshots/screenshot1.png)
+
 Multi-protocol notification router. Receives events from webhooks, syslog, and
 SMTP, attributes them to a sending entity, normalizes them into a canonical
 shape, deduplicates, suppresses, routes by group rules, and dispatches to
