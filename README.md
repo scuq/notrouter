@@ -1,13 +1,17 @@
 # notrouter
 
-Multi-protocol notification router. Receives events from webhooks and syslog,
-attributes them to a sending entity, normalizes them into a canonical shape,
-deduplicates, suppresses, routes by group rules, and dispatches to compile-time
-output plugins (Webex, generic webhook, file, stdout).
+Multi-protocol notification router. Receives events from webhooks, syslog, and
+SMTP, attributes them to a sending entity, normalizes them into a canonical
+shape, deduplicates, suppresses, routes by group rules, and dispatches to
+compile-time output plugins (Webex, generic webhook, file, stdout).
 
-Single Go binary. Two external dependencies (`gopkg.in/yaml.v3`,
-`prometheus/client_golang`). Designed to handle 1000 messages/second sustained
-on modest hardware.
+Single Go binary. External dependencies kept minimal:
+- `gopkg.in/yaml.v3` (config)
+- `github.com/prometheus/client_golang` (metrics)
+- `golang.org/x/crypto` (admin password hashing)
+- `github.com/emersion/go-smtp` (SMTP receiver)
+
+Designed to handle 1000 messages/second sustained on modest hardware.
 
 ## Pipeline
 
@@ -34,13 +38,16 @@ make metrics
 ```
 
 The shipped `config.yaml` accepts events on:
-- `:8080` — HTTP webhook receiver (paths `/webhook/nagios`, `/webhook/generic`)
+- `:8080` — HTTP webhook receiver (paths `/webhook/nagios`, `/webhook/generic`, `/webhook/grafana`)
 - `:5514/udp` — syslog UDP (RFC3164 + RFC5424)
 - `:5514/tcp` — syslog TCP (RFC6587 octet-counted + LF framing, auto-detected)
-- `:9090` — admin/metrics (basic auth: `admin`/`admin`)
+- `:2525` — SMTP receiver (CheckMK and generic email-shaped notifications)
+- `:9090` — admin/metrics web UI (basic auth seeded with `admin`/`admin`)
 
-Events are routed to the `noc-team` group, which delivers to `stdout_debug`
-and `file_audit` (writes to `/tmp/notrouter-audit.jsonl`).
+Out of the box, events route to a `test-channel` group containing a Webex
+test space and a `file_audit` plugin (writes to
+`/var/log/notrouter/audit.jsonl`). Replace the placeholder Webex webhook URL
+with a real one before starting.
 
 ## Concepts
 
@@ -49,7 +56,7 @@ and `file_audit` (writes to `/tmp/notrouter-audit.jsonl`).
 ```go
 {
   ID         string             // generated UUID-ish
-  Source     string             // "webhook:nagios" | "syslog-udp" | ...
+  Source     string             // "webhook:nagios" | "syslog-udp" | "smtp-25" | ...
   Entity     string             // who sent this (resolved from profile)
   EntityIP   net.IP             // optional, for CIDR matching
   Topic      string             // what it's about
@@ -64,7 +71,32 @@ and `file_audit` (writes to `/tmp/notrouter-audit.jsonl`).
 
 Tells the entity resolver and normalizer how to extract data from a specific
 source format. Webhook endpoints bind to a named profile; syslog has an
-implicit `syslog` profile.
+implicit `syslog` profile; SMTP events go through an optional mail-parser
+chain that selects a profile per message.
+
+### Mail parser — vendor-aware SMTP parsing
+
+For SMTP events, mail parsers run before profile selection. Each parser:
+1. Matches on subject prefix (e.g. `Check_MK: `)
+2. Runs a sequence of YAML-defined extractors against the email
+3. Selects which profile to apply downstream
+
+This is how vendor-specific shapes (CheckMK, future Grafana SMTP, etc.) get
+turned into structured events without per-vendor Go code. Adding a new
+vendor parser is a YAML edit, not a recompile.
+
+### Origin ID and source aliases
+
+Every event has an `origin_id` attribute identifying the sender:
+- SMTP: the From: address (e.g. `cmk@2f4aa25ce51e`)
+- Webhook: the client IP (post-XFF resolution if behind a trusted proxy)
+- Syslog: the source IP
+
+A `source_aliases` map turns raw origin IDs into human-readable names
+(`cmk@2f4aa25ce51e` → `checkmk-prod`). Templates display the alias if
+present, falling back to raw origin_id otherwise. Useful when running
+multiple monitoring instances where the raw origin_id is a docker
+container ID or random hostname.
 
 ### Group — a named bucket of subscribers
 
@@ -88,6 +120,16 @@ optionally logged (rate-limited per rule).
 
 ## Configuration
 
+### Strict YAML mode
+
+By default, notrouter rejects unknown YAML fields at load time. This
+catches typos that would otherwise silently disable rules
+(`urgency.from_field` misspelled, profile name slightly off, etc.).
+
+If you need to load a config with unknown fields (e.g. during a migration),
+set `NOTROUTER_LAX_YAML=1` as an env var. The error message names which
+field tripped the check, so fixing is usually a one-line edit.
+
 ### Receivers and profiles
 
 ```yaml
@@ -99,11 +141,33 @@ listen:
 
 receivers:
   webhook:
+    # Optional. When notrouter sits behind a reverse proxy, list the
+    # proxy's network here so X-Forwarded-For headers are trusted and
+    # walked to find the real client IP. Direct (non-proxied) connections
+    # ignore XFF entirely - prevents spoofing.
+    trusted_proxies:
+      - "10.89.0.0/16"
+
     endpoints:
       - path: /webhook/nagios
         profile: nagios
       - path: /webhook/grafana
         profile: grafana
+
+  smtp:
+    port_25:
+      enabled: true
+      listen: ":2525"            # use 25 in production with appropriate caps
+      hostname: "notrouter.example.com"
+      allowed_ips:
+        - "127.0.0.1/32"
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+      allowed_rcpt_to:
+        - "alerts@notrouter.example.com"
+      allowed_from: []           # empty = no sender restriction
+      max_message_bytes: 1048576
 
 profiles:
   nagios:
@@ -121,21 +185,104 @@ profiles:
           UNREACHABLE: high
     attributes:
       msg:
-        from_json: "$.output"        # extract Nagios output to Attributes.msg
+        from_json: "$.output"
       service:
         from_json: "$.service"
       source_kind:
-        static: "nagios"             # always set this attribute
+        static: "nagios"
 ```
 
 Entity resolution strategies, evaluated in order:
 1. `from_json: "$.path"` — JSONPath against parsed body
-2. `from_field: "hostname"` — copy from an existing attribute (e.g. parsed syslog hostname)
+2. `from_field: "hostname"` — copy from an existing attribute
 3. `from_regex: "..."` — regex with optional capture group
 4. fallback to source IP
 
 If no strategy succeeds, the event is dropped and logged with reason
 `entity_unresolved` (visible in `notrouter_events_dropped_total` metric).
+
+### Mail parsers
+
+Vendor-specific SMTP parsers. First match wins. If no parser matches, the
+event flows through the `smtp_generic` profile.
+
+```yaml
+mail_parsers:
+  - name: checkmk
+    match:
+      subject_prefix: "Check_MK: "
+    profile: checkmk
+    extract:
+      # Body labeled fields - "Label: value" lines
+      - type: from_body_kvline
+        label: "Host"
+        attribute: host
+      - type: from_body_kvline
+        label: "Service"
+        attribute: service
+      - type: from_body_kvline
+        label: "Event"
+        attribute: event_raw
+
+      # Multi-line label - captures everything from "Perfdata:" to EOF
+      - type: from_body_after_label
+        label: "Perfdata"
+        attribute: perfdata
+
+      # Email headers
+      - type: from_header
+        header: "Message-Id"
+        attribute: message_id
+
+      # Try each alternative until one matches; first-match-wins
+      - type: dispatch_first_match
+        alternatives:
+          - type: from_attribute_regex
+            source: event_raw
+            pattern: '^(?P<previous_state>\w+)\s+->\s+(?P<state>\w+)\s*$'
+          - type: from_attribute_regex
+            source: event_raw
+            pattern: '^(?P<event_kind>.+?)\s+\((?P<state>\w+)\)\s*$'
+
+      # Computed attribute via Go template
+      - type: from_template
+        attribute: type
+        template: '{{ if .service }}service{{ else }}host{{ end }}'
+```
+
+Available extractor types:
+
+| Type | Required fields | What it does |
+|---|---|---|
+| `from_subject_regex` | `pattern` | Regex with named captures against the email subject |
+| `from_attribute_regex` | `source`, `pattern` | Regex against an existing attribute |
+| `from_body_kvline` | `label`, `attribute` | Match a single `Label:` line, capture trimmed value |
+| `from_body_after_label` | `label`, `attribute` | Capture everything after `Label:` to end of body (multi-line) |
+| `from_header` | `header`, `attribute` | Lookup an RFC 5322 email header |
+| `from_template` | `template`, `attribute` | Render a Go template against existing attributes |
+| `dispatch_first_match` | `alternatives` | Try each sub-extractor; stop at first that matches |
+
+Validation happens at load time. Bad regex, malformed templates, or
+unknown extractor types fail the startup, not at request time.
+
+### Source aliases
+
+```yaml
+source_aliases:
+  # SMTP origin (From: address)
+  "cmk@2f4aa25ce51e":   "checkmk-prod"
+  "cmk@a1b2c3d4e5f6":   "checkmk-staging"
+
+  # Webhook origin (real client IP, post-XFF resolution)
+  "10.21.146.1":       "nagios-main"
+  "10.21.146.2":       "nagios-edge"
+```
+
+When an event's `origin_id` matches a key here, `origin_alias` is set on
+the event. Used by templates (e.g. the Webex source-line footer) and
+visible in audit logs and the replay UI.
+
+Optional. Missing section means no aliasing.
 
 ### Dedup
 
@@ -166,14 +313,44 @@ suppressors:
       entity_regex: "^db-prod-.*"
     active:
       from: 2026-05-15T22:00:00Z
-      until: 2026-05-15T23:30:00Z   # inactive outside this window
+      until: 2026-05-15T23:30:00Z
 
 logging:
-  suppressor_log_throttle: 60s     # max one log line per rule per 60s
+  suppressor_log_throttle: 60s
 ```
 
 A predicate is `AND` across its match fields, `OR` across rules. The same
 matcher engine is used by the router.
+
+### Trace mode (debug)
+
+For diagnosing receiver issues, trace mode captures raw incoming events to
+disk before any pipeline processing. Default disabled — when enabled,
+notrouter logs a periodic warning to remind operators it's still on.
+
+```yaml
+trace:
+  enabled: true
+  output_dir: /var/log/notrouter/trace
+  reminder_interval: 1h            # warn this often when enabled
+  receivers:
+    smtp:
+      enabled: true
+      max_files: 50                # one .eml per message; oldest deleted at limit
+    syslog_udp:
+      enabled: false
+      max_bytes_per_file: 10485760 # 10 MiB rotation
+      max_files: 3
+    syslog_tcp:
+      enabled: false
+    webhook:
+      enabled: false
+```
+
+SMTP traces are one .eml file per message. Syslog and webhook traces are
+JSONL with size-based rotation. Output dir gets `0700` perms; files
+`0600`. Sensitive data (auth headers, alert details) is written cleartext —
+mount a separate volume and exclude from backups.
 
 ### Plugin instances
 
@@ -185,10 +362,20 @@ plugin_instances:
       webhook_url: "https://webexapis.com/v1/webhooks/incoming/..."
       timeout: "15s"
       rate_limit_grace: "2s"     # added to Retry-After value
-      # template: |              # optional - default uses urgency emoji
-      #   **{{.Topic}}** on `{{.Entity}}`
+      template: |
+        {{- if eq .Attributes.notiftype "RECOVERY" -}}✅
+        {{- else if eq .Urgency "critical" -}}❌
+        {{- else -}}ℹ️
+        {{- end }} {{.Attributes.state}} · `{{.Entity}}`
+        {{- if .Attributes.service }} · {{.Attributes.service}}{{ end }}
+        {{- if .Attributes.msg }} · `{{.Attributes.msg}}`{{ end }}
+
+        <small><i>via {{ .Attributes.source_kind }} ·
+          {{- if .Attributes.origin_alias }} {{ .Attributes.origin_alias }}
+          {{- else if .Attributes.origin_id }} {{ .Attributes.origin_id }}
+          {{- end }} · {{ .Source }}</i></small>
     retry:
-      attempts: 5                # override default of 3
+      attempts: 5
       backoff: [2s, 5s, 10s, 30s, 60s]
 
   generic_hook:
@@ -225,20 +412,27 @@ Available plugin types (registered at compile time, no runtime loading):
 
 ```yaml
 groups:
+  test-channel:
+    subscribers: [webex_test, file_audit]
   noc-team:
     subscribers: [webex_noc, file_audit]
   db-admins:
     subscribers: [generic_hook, file_audit]
 
 routing:
+  - match: {}                       # catch-all
+    groups: [test-channel]
+
   - match:
-      entity_ip_in: ["10.1.1.0/24", "10.1.2.0/24"]
+      topic:
+        - "nagios-host-down"
+        - "nagios-host-up"
+        - "checkmk-service-crit"
     groups: [noc-team]
+
   - match:
       entity_regex: "^db-.*"
     groups: [db-admins]
-  - match: {}                    # catch-all
-    groups: [noc-team]
 ```
 
 Multiple rules can match — group sets are unioned. If two groups subscribe
@@ -271,8 +465,8 @@ pipeline:
   raw_buffer_size: 4096          # receivers → resolver
   normal_buffer_size: 2048       # between mid stages
   instance_buffer_size: 1024     # per-plugin queue
-  resolver_workers: 4            # entity-resolver goroutine count
-  normalizer_workers: 4          # normalizer goroutine count
+  resolver_workers: 4
+  normalizer_workers: 4
 ```
 
 ## Sending events — usage examples
@@ -288,7 +482,7 @@ curl -X POST http://localhost:8080/webhook/generic \
 The `generic` profile extracts `entity` from `$.entity`. Topic and urgency
 fall back to defaults (`unclassified`, `info`).
 
-### Nagios via webhook (recommended Nagios integration)
+### Nagios via webhook
 
 In your Nagios `commands.cfg`:
 
@@ -310,9 +504,34 @@ define command {
 }
 ```
 
-Then bind these commands to your contacts. Same data shape that the
-upstream `notify_webhook.py` expected from environment variables, just
-delivered via HTTP.
+Then bind these commands to your contacts.
+
+### CheckMK via SMTP
+
+CheckMK sends notifications via email by default. Point CheckMK's
+notification rule at notrouter's SMTP receiver:
+
+In CheckMK: Setup → Events → Notifications → add rule with method
+"asciimail" → set the SMTP server to `notrouter:2525` and the recipient
+to one of your `allowed_rcpt_to` values (e.g. `alerts@notrouter.local`).
+
+Notrouter's CheckMK mail parser handles:
+- Service state transitions (`OK -> CRIT`, `CRIT -> OK`, etc.)
+- Host state transitions (`UP -> DOWN`, etc.)
+- Lifecycle events: Acknowledged, Downtime Start/End, Flapping Start/Stop
+
+Topic format: `checkmk-<service|host>-<state-lower>` (e.g.
+`checkmk-service-crit`, `checkmk-host-down`).
+
+### Generic SMTP
+
+Any email sent to an `allowed_rcpt_to` address gets the `smtp_generic`
+profile. Subject and body are extracted as attributes; topic is hardcoded
+to `smtp` (filter via routing if you don't want these in your channels).
+
+```sh
+echo "test alert body" | mail -s "test alert" alerts@notrouter.local
+```
 
 ### Syslog UDP (RFC3164 — BSD format)
 
@@ -355,7 +574,52 @@ body in attributes — visibility-first, not strict.
 
 ## Operations
 
-### Endpoints
+### Admin web UI
+
+`/admin/ui` exposes a small set of pages for runtime inspection and
+configuration:
+
+| Path | Purpose |
+|---|---|
+| `/admin/ui/` | Dashboard (queue depths, dedup size, instance status) |
+| `/admin/ui/config` | YAML editor with validate/save/reload |
+| `/admin/ui/logs` | Recent log lines (in-memory ring buffer) |
+| `/admin/ui/test` | Send synthetic events through the pipeline |
+| `/admin/ui/replay` | Browse audit log entries; analyze how routing/dedup/suppression would handle each |
+| `/admin/ui/tokens` | Manage admin user passwords |
+| `/admin/ui/webhook-keys` | Manage bearer tokens for webhook endpoints |
+
+Initial credentials: `admin`/`admin`. The UI forces a password change on
+first login. Sessions last `auth.admin.session_ttl` (default 2h).
+
+### Replay UI / routing analyzer
+
+The replay page is a debugging tool. Pick any event from the audit log and
+see, without sending real traffic:
+
+- Whether suppression would match (and which rule)
+- Whether dedup would consider it a duplicate (read-only check)
+- Which routing rules match, and what subscribers would receive it
+- Final subscriber list
+
+Useful when changing routing rules — verify against historical events
+before going live.
+
+The same logic is exposed via the API for scripting:
+
+```sh
+# Synthetic event
+curl -s -u admin:PW -X POST http://localhost:9090/admin/api/routing/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{"event":{"topic":"checkmk-host-down","entity":"TEST","urgency":"high","attributes":{"state":"DOWN","type":"host","source_kind":"checkmk"}}}'
+
+# Real audit entry
+curl -s -u admin:PW -X POST http://localhost:9090/admin/api/routing/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{"audit_id":"20260509T084146-0f6509b80b55d594"}'
+```
+
+### HTTP endpoints
 
 | Path | Auth | Purpose |
 |---|---|---|
@@ -364,18 +628,31 @@ body in attributes — visibility-first, not strict.
 | `GET /version` | none | build version + commit |
 | `GET /admin/state` | basic | dedup size, queue depths, pending tracker entries |
 | `GET /admin/deliveries` | basic | last 200 finalized deliveries with per-subscriber state |
-| `POST /admin/dedup/clear` | basic | wipe dedup map (panic button after misconfig) |
+| `GET /admin/api/audit/recent` | basic | last N audit entries (`?limit=50&filter=substring`) |
+| `POST /admin/api/routing/analyze` | basic | dry-run analyzer (synthetic event or audit_id) |
+| `POST /admin/dedup/clear` | basic | wipe dedup map |
 
 `/healthz` reports `degraded` when:
 - any plugin instance queue is ≥90% full
 - the tracker has more than 10000 pending deliveries
 - the dedup map has more than 1M entries
 
+### Audit log
+
+The default config writes every dispatched event to
+`/var/log/notrouter/audit.jsonl` via the `file_audit` plugin. Each line
+is one JSON object containing the full normalized event.
+
+Useful for postmortems, compliance review, and as the data source for
+the replay UI. Recommended: rotate via your platform's tools (logrotate,
+journald with size limits, or a sidecar log shipper).
+
 ### Make targets
 
 ```sh
 make build              # static binary in bin/
 make dev                # go run with config.yaml
+make dev-docker         # build + restart container
 make test               # go test -race ./...
 make vet
 make docker             # local-arch image
@@ -383,22 +660,23 @@ make docker-multiarch   # buildx for linux/amd64+arm64
 make clean
 
 # admin shortcuts
-make health             # /healthz
-make metrics            # /metrics filtered to notrouter_*
-make admin-state        # pretty-printed /admin/state
-make admin-deliveries   # pretty-printed /admin/deliveries
-make admin-dedup-clear  # POST /admin/dedup/clear
+make health
+make metrics
+make admin-state
+make admin-deliveries
+make admin-dedup-clear
 
 # smoke targets
-make smoke-webhook              # generic webhook
-make smoke-nagios               # nagios-shaped webhook
-make smoke-nagios-rich          # nagios with output for attribute extraction
-make smoke-syslog-rfc3164       # BSD-format syslog
-make smoke-syslog-rfc5424       # structured syslog
-make smoke-syslog-tcp-octet     # RFC6587 octet-counted TCP
-make smoke-syslog-tcp-lf        # LF-terminated TCP
-make smoke-failer               # routes to a group with the failer plugin
-make smoke-all                  # fire every smoke target
+make smoke-webhook
+make smoke-nagios
+make smoke-nagios-rich
+make smoke-syslog-rfc3164
+make smoke-syslog-rfc5424
+make smoke-syslog-tcp-octet
+make smoke-syslog-tcp-lf
+make smoke-smtp                 # send a synthetic email through SMTP receiver
+make smoke-failer
+make smoke-all
 
 # load testing
 make loadtest                   # 1000 msg/s for 30s
@@ -478,8 +756,27 @@ plugin_instances:
 ```
 
 For HTTP-based plugins, see `internal/plugins/httpsink/` for a reusable
-client with Retry-After parsing, status classification (retryable vs
-not), connection pooling, and proxy/TLS-skip support.
+client with Retry-After parsing, status classification, connection
+pooling, and proxy/TLS-skip support.
+
+## Adding a new mail parser (no Go required)
+
+For a new SMTP source vendor, write a parser entry under `mail_parsers:`
+in YAML. Pick a unique `subject_prefix` for matching, and chain the
+extractor primitives to pull what you need from the email.
+
+The CheckMK parser in the shipped config is a good reference. Common
+patterns:
+
+- `Label: value` body lines → `from_body_kvline`
+- Multi-line tail values → `from_body_after_label`
+- Subject parsing → `from_subject_regex` with named captures
+- Branching on attribute shape → `dispatch_first_match` with two regex
+  alternatives
+- Computed attributes (e.g. derive `notiftype` from `state`) → `from_template`
+
+Validation is at startup. A new parser config either loads cleanly or
+notrouter refuses to start with an error pointing at the bad extractor.
 
 ## Project layout
 
@@ -488,32 +785,40 @@ cmd/
   notrouter/main.go          binary entry point, pipeline wiring
   loadtest/main.go           QPS load tester
 internal/
-  admin/                     /healthz + /admin/* HTTP server, probe interfaces
-  auth/                      basic auth helper
-  config/                    YAML schema + load + validation
+  admin/                     /healthz + /admin/* HTTP server, web UI, probes
+  analyzer/                  routing/suppress/dedup dry-run logic + audit reader
+  auth/                      basic auth helper, session/credential store
+  config/                    YAML schema + load + validation (strict by default)
   dedup/                     in-memory TTL map + sweeper
   dispatch/                  fan-out, per-instance worker, retry, delivery tracker
   event/                     canonical Event type
   jsonpath/                  tiny JSONPath subset ($.foo.bar[0])
-  logging/                   slog setup
+  logging/                   slog setup, in-memory ring buffer for /admin/ui/logs
   metrics/                   Prometheus counters
   parser/
     syslog.go                RFC3164 + RFC5424 parser
     entity.go                profile-driven entity resolver
-    normalize.go             text/template + JSON-path normalizer
+    normalize.go             text/template + JSON-path normalizer, alias resolver
+  parsers/                   mail parser framework (CheckMK + future vendors)
   pipeline/                  Stage interface, channel topology, predicate engine
   plugins/
     plugin.go                plugin registry
     template.go              shared template compiler/renderer
     httpsink/                shared HTTP client for webhook-style plugins
-    webex/                   Webex with Retry-After
+    webex/                   Webex with Retry-After handling
     webhook/                 generic webhook
     file/                    JSONL file writer
     stdout/                  stdout printer
     failer/                  always-fails test plugin
-  receivers/                 webhook, syslog UDP, syslog TCP
+  receivers/
+    webhook.go               HTTP webhook receiver, XFF-aware origin extraction
+    syslog_udp.go            UDP syslog receiver
+    syslog_tcp.go            TCP syslog receiver (RFC6587 + LF, auto-detect)
+    smtp.go                  SMTP receiver (port 25, allowlist-based)
+    proxy_trust.go           trusted-proxy XFF walker
   router/                    group resolution
   suppress/                  predicate-based suppression with throttled logging
+  trace/                     debug capture of raw incoming events to disk
   version/                   build-time injected version/commit
 ```
 
@@ -534,18 +839,19 @@ ceiling is bound by network egress to plugins, not pipeline overhead.
 - **No persistence.** Events in flight at restart are lost. Dedup state is
   volatile. Acceptable for a notification router; if you need durability,
   put a persistent queue in front.
-- **Single tenant.** No per-team RBAC or admin UI. Built for a single ops
-  team operating one instance.
+- **Single tenant.** No per-team RBAC. Built for a single ops team
+  operating one instance.
 - **Compile-time plugins only.** No `.so` loading, no Lua, no scripting.
   Adding a plugin requires recompiling and redeploying the binary. This is
   intentional — runtime plugin loading has been a long source of pain in
   monitoring tools and we don't want to repeat it.
-- **No SMTP receiver, no SNMP traps.** Both were in scope originally and
-  deferred. The architecture supports adding them as new receiver types
-  without touching the pipeline.
-- **Static admin auth.** `admin:admin` by default, configurable in YAML.
-  Suitable for an internal-network deployment behind a reverse proxy or
-  service mesh; not suitable for direct internet exposure.
+- **No SNMP traps.** Architecture supports adding SNMP as a new receiver
+  type without touching the pipeline; not yet implemented.
+- **SMTP receiver is plain port 25.** No STARTTLS, no AUTH yet. Suitable
+  for an internal-network-only deployment. Port 587 + AUTH + STARTTLS is
+  on the roadmap.
+- **Admin auth is local-only.** Built-in user/password store with bcrypt;
+  OIDC/SSO integration is on the roadmap.
 
 ## License
 
