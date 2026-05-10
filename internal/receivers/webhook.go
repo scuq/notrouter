@@ -38,6 +38,7 @@ type WebhookReceiver struct {
 	requireAuth bool // forces auth even when no keys exist
 
 	tracer  *trace.Tracer
+	trustedProxies *proxyTrust
 }
 
 // SetTracer wires in an optional trace.Tracer. nil-safe.
@@ -45,6 +46,26 @@ func (w *WebhookReceiver) SetTracer(t *trace.Tracer) {
 	if w != nil {
 		w.tracer = t
 	}
+}
+
+// SetTrustedProxies wires in the trusted-proxy list for X-Forwarded-For
+// trust walking. Pass an empty/nil slice to disable XFF parsing (events
+// will use the raw connection peer IP, which is the pre-v0.3.3.1
+// behavior). Errors compiling CIDRs are returned synchronously so the
+// runtime can fail-fast at startup rather than discover them at
+// request-time.
+//
+// Safe to call before Start().
+func (w *WebhookReceiver) SetTrustedProxies(cidrs []string) error {
+	if w == nil {
+		return nil
+	}
+	pt, err := compileTrustedProxies(cidrs)
+	if err != nil {
+		return err
+	}
+	w.trustedProxies = pt
+	return nil
 }
 
 // NewWebhook is the legacy constructor (no auth). Kept for backwards
@@ -145,13 +166,31 @@ func (w *WebhookReceiver) Start(ctx context.Context, wg *sync.WaitGroup) error {
 			ev.Attributes["http_method"] = r.Method
 			ev.Attributes["http_path"] = r.URL.Path
 			ev.Attributes["http_remote"] = r.RemoteAddr
-			// origin_id - stable across-receiver identifier for the sender.
-			// Uses IP only (no port); port varies per request but IP doesn't.
-			originID := r.RemoteAddr
-			if h, _, splitErr := net.SplitHostPort(r.RemoteAddr); splitErr == nil {
-				originID = h
+
+			// origin_id - stable across-receiver identifier for the real
+			// client. When trustedProxies is configured AND RemoteAddr is
+			// in that list, walk X-Forwarded-For to find the actual sender;
+			// otherwise use RemoteAddr (port-stripped) as before.
+			//
+			// If RemoteAddr is trusted but XFF is missing, log a warning -
+			// likely a proxy misconfiguration that the operator should fix.
+			originID, missingXFF := w.trustedProxies.extractClientIP(
+				r.RemoteAddr, r.Header.Get("X-Forwarded-For"),
+			)
+			if missingXFF {
+				w.log.Warn("webhook: trusted proxy did not set X-Forwarded-For; using raw RemoteAddr",
+					"remote_addr", r.RemoteAddr,
+					"path", r.URL.Path,
+					"hint", "check reverse proxy config: it should set X-Forwarded-For")
 			}
 			ev.Attributes["origin_id"] = originID
+
+			// EntityIP enables entity_ip_in routing predicates against the
+			// real client (not the proxy). Same logic as origin_id - they
+			// represent the same identity, expressed as IP.
+			if parsedIP := net.ParseIP(originID); parsedIP != nil {
+				ev.EntityIP = parsedIP
+			}
 
 			metrics.EventsReceived.WithLabelValues("webhook:" + ep.Profile).Inc()
 

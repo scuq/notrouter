@@ -94,6 +94,7 @@ type WebhookReceiverConfig struct {
 	// Default false: enforcement turns on automatically once the first
 	// key is minted via the UI - safe rollout, no surprise lockouts.
 	RequireAuth bool `yaml:"require_auth"`
+	TrustedProxies []string          `yaml:"trusted_proxies,omitempty"`
 }
 
 type WebhookEndpoint struct {

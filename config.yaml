@@ -25,6 +25,9 @@ auth:
 
 receivers:
   webhook:
+    trusted_proxies:
+      - "10.89.0.0/16"          # your reverse proxy network
+      - "127.0.0.1/32"          # localhost (for local tests)
     endpoints:
       - path: /webhook/nagios
         profile: nagios

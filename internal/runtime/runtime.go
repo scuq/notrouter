@@ -168,6 +168,14 @@ func (p *Pipeline) Start(parent context.Context) error {
 		wh = receivers.NewWebhook(p.cfg.Listen.Webhook, p.cfg.Receivers.Webhook.Endpoints, p.pl.RawCh, p.log)
 	}
 	wh.SetTracer(p.tracer)
+	if wh != nil {
+		if err := wh.SetTrustedProxies(p.cfg.Receivers.Webhook.TrustedProxies); err != nil {
+			p.cancel()
+			p.pl.Wait()
+			closeInstances(p.instances, p.log)
+			return fmt.Errorf("webhook trusted_proxies: %w", err)
+		}
+	}
 	if err := wh.Start(p.ctx, &p.ioWg); err != nil {
 		p.cancel()
 		p.pl.Wait()
