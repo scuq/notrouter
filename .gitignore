@@ -11,3 +11,5 @@ hotfix*.sh
 cookies.txt
 
 config-backups/
+
+.claude
