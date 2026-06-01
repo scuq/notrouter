@@ -228,6 +228,48 @@ func applyAttributeExtractors(extractors map[string]config.AttributeExtractor, j
 				log.Debug("attribute extractor: path miss",
 					"key", key, "path", ex.FromJSON)
 			}
+		case ex.FromJSONString != "":
+			// Two-step JSON dereference. Used when a field in the outer
+			// JSON is itself a JSON-encoded string (e.g. Logstash's
+			// ansible_result is a JSON string containing per-host stats).
+			//
+			// Step 1: read the outer-JSON field as a raw string.
+			// Step 2: parse that string as JSON.
+			// Step 3: optionally extract a sub-path via ex.Select.
+			//
+			// If ex.Select is empty, the whole parsed inner value is
+			// stringified (intended for opaque blob attributes; rarely
+			// useful but harmless).
+			if jsonVal == nil {
+				log.Debug("attribute extractor: no JSON to extract from",
+					"key", key, "path", ex.FromJSONString)
+				continue
+			}
+			innerRaw, ok := jsonpath.GetString(jsonVal, ex.FromJSONString)
+			if !ok || innerRaw == "" {
+				log.Debug("attribute extractor: outer path miss",
+					"key", key, "path", ex.FromJSONString)
+				continue
+			}
+			var inner interface{}
+			if err := json.Unmarshal([]byte(innerRaw), &inner); err != nil {
+				log.Debug("attribute extractor: inner JSON parse failed",
+					"key", key, "path", ex.FromJSONString, "err", err)
+				continue
+			}
+			if ex.Select == "" {
+				// Stringify whole parsed value.
+				if b, err := json.Marshal(inner); err == nil {
+					ev.Attributes[key] = string(b)
+				}
+				continue
+			}
+			if s, ok := jsonpath.GetString(inner, ex.Select); ok && s != "" {
+				ev.Attributes[key] = s
+			} else {
+				log.Debug("attribute extractor: inner path miss",
+					"key", key, "outer", ex.FromJSONString, "select", ex.Select)
+			}
 		}
 	}
 }

@@ -252,9 +252,11 @@ type UrgencyMapping struct {
 }
 
 type AttributeExtractor struct {
-	FromJSON  string `yaml:"from_json,omitempty"`
-	FromField string `yaml:"from_field,omitempty"`
-	Static    string `yaml:"static,omitempty"`
+	FromJSON       string `yaml:"from_json,omitempty"`
+	FromField      string `yaml:"from_field,omitempty"`
+	Static         string `yaml:"static,omitempty"`
+	FromJSONString string `yaml:"from_json_string,omitempty"`
+	Select         string `yaml:"select,omitempty"`
 }
 
 type DedupConfig struct {
