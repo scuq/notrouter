@@ -95,7 +95,103 @@ smoke-syslog-tcp-lf: ## LF-terminated syslog over TCP
 	echo '<134>Oct 11 22:14:15 router-fra-01 sshd[1234]: Failed login' | nc -w1 localhost 5514
 
 .PHONY: smoke-all
-smoke-all: smoke-webhook smoke-nagios smoke-syslog-rfc3164 smoke-syslog-rfc5424 smoke-syslog-tcp-octet smoke-syslog-tcp-lf ## fire every smoke target
+smoke-all: smoke-webhook smoke-nagios smoke-syslog-rfc3164 smoke-syslog-rfc5424 smoke-syslog-tcp-octet smoke-syslog-tcp-lf smoke-tcp-json smoke-tcp-json-ansible smoke-tcp-json-multi ## fire every smoke target
+
+
+# ---- v0.3.5 tcp_json smoke targets ----
+# These send synthetic newline-delimited JSON to the tcp_json receiver
+# on port 5044. Requires receivers.tcp_json.port_5044.enabled=true in
+# config.yaml and 5044 published from the container.
+
+.PHONY: smoke-tcp-json
+smoke-tcp-json: ## bare-bones tcp_json: one JSON line, exits on TCP close
+	@command -v python3 >/dev/null || (echo "python3 required for smoke-tcp-json"; exit 1)
+	@python3 -c '\
+import socket, json; \
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); \
+s.connect(("localhost", 5044)); \
+event = {"ansible_type":"finish","host":"smoke-test-host","@timestamp":"2026-06-02T00:00:00Z"}; \
+s.sendall((json.dumps(event) + "\n").encode("utf-8")); \
+s.close(); \
+print("sent one tcp_json event to localhost:5044")'
+
+.PHONY: smoke-tcp-json-ansible
+smoke-tcp-json-ansible: ## simulated Ansible logstash callback finish event
+	@command -v python3 >/dev/null || (echo "python3 required for smoke-tcp-json-ansible"; exit 1)
+	@python3 -c '\
+import socket, json; \
+inner_meta = {"title":"Smoke Test Playbook","uri":"https://example.com/runs/smoke","repo":"https://gitlab.example.com/smoke"}; \
+inner_result = {"localhost":{"ok":3,"changed":0,"failures":0,"unreachable":0},"smoke-host-1":{"ok":12,"changed":2,"failures":0,"unreachable":0}}; \
+event = {"ansible_type":"finish","ansible_playbook":"smoke-test.yml","ansible_playbook_duration":7.42,"ansible_pre_command_output":json.dumps(inner_meta),"ansible_result":json.dumps(inner_result),"host":"ansible-controller-1","@timestamp":"2026-06-02T00:00:00Z","@version":"1"}; \
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); \
+s.connect(("localhost", 5044)); \
+s.sendall((json.dumps(event) + "\n").encode("utf-8")); \
+s.close(); \
+print("sent one simulated ansible finish event to localhost:5044")'
+
+.PHONY: smoke-tcp-json-multi
+smoke-tcp-json-multi: ## persistent connection sending 5 events back-to-back
+	@command -v python3 >/dev/null || (echo "python3 required for smoke-tcp-json-multi"; exit 1)
+	@python3 -c '\
+import socket, json, time; \
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); \
+s.connect(("localhost", 5044)); \
+[s.sendall((json.dumps({"ansible_type":"task","ansible_task":"task-"+str(i),"host":"persistent-test","seq":i}) + "\n").encode("utf-8")) for i in range(5)]; \
+time.sleep(0.5); \
+s.close(); \
+print("sent 5 events on a single persistent connection to localhost:5044")'
+
+# ---- v0.3.5 real Ansible end-to-end ----
+# This actually runs ansible-playbook with community.general.logstash
+# callback. Opt-in because it needs ansible + python-logstash installed
+# on the host running make.
+
+.PHONY: smoke-tcp-json-ansible-real
+smoke-tcp-json-ansible-real: ## run a real ansible-playbook against notrouter (requires ansible, community.general)
+	@command -v ansible-playbook >/dev/null || (echo "ansible-playbook required - install ansible-core"; exit 1)
+	@python3 -c 'import logstash' 2>/dev/null || (echo "python-logstash required - pip install python-logstash"; exit 1)
+	@ansible-galaxy collection list community.general >/dev/null 2>&1 || (echo "community.general collection required - ansible-galaxy collection install community.general"; exit 1)
+	@rm -rf /tmp/notrouter-ansible-smoke
+	@mkdir -p /tmp/notrouter-ansible-smoke
+	@printf '%s\n' \
+	  '[defaults]' \
+	  'callback_whitelist = community.general.logstash' \
+	  'callbacks_enabled = logstash' \
+	  'host_key_checking = False' \
+	  'stdout_callback = default' \
+	  '' \
+	  '[callback_logstash]' \
+	  'server = localhost' \
+	  'port = 5044' \
+	  'type = ansible' \
+	  'pre_command = cat meta.json | tr -d "\\n"' \
+	  > /tmp/notrouter-ansible-smoke/ansible.cfg
+	@printf '%s\n' \
+	  '{' \
+	  '  "title": "Notrouter Smoke Test",' \
+	  '  "uri": "https://example.com/runs/smoke",' \
+	  '  "repo": "https://gitlab.example.com/smoke"' \
+	  '}' \
+	  > /tmp/notrouter-ansible-smoke/meta.json
+	@printf '%s\n' \
+	  '---' \
+	  '- name: notrouter tcp_json smoke test' \
+	  '  hosts: localhost' \
+	  '  connection: local' \
+	  '  gather_facts: false' \
+	  '  tasks:' \
+	  '    - name: pretend to do work' \
+	  '      ansible.builtin.debug:' \
+	  '        msg: "tcp_json smoke task ran"' \
+	  '    - name: pretend to do more work' \
+	  '      ansible.builtin.command: /bin/true' \
+	  '      changed_when: false' \
+	  > /tmp/notrouter-ansible-smoke/smoke.yml
+	@cd /tmp/notrouter-ansible-smoke && ANSIBLE_CONFIG=./ansible.cfg ansible-playbook -i localhost, smoke.yml
+	@echo ""
+	@echo "Ansible playbook ran. Check notrouter audit log for finish event:"
+	@echo "  docker exec notrouter tail -1 /var/log/notrouter/audit.jsonl | python3 -m json.tool | grep -E 'topic|entity|source|ansible_type'"
+
 
 # ---- pass 3 smoke targets ----
 .PHONY: smoke-syslog-tcp-octet

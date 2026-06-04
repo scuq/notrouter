@@ -84,6 +84,7 @@ type ReceiversConfig struct {
 	Webhook WebhookReceiverConfig `yaml:"webhook"`
 	Syslog  SyslogReceiverConfig  `yaml:"syslog"`
 	SMTP    SMTPReceiverConfig    `yaml:"smtp"`
+	TCPJSON TCPJSONReceiverConfig `yaml:"tcp_json"`
 }
 
 type WebhookReceiverConfig struct {
@@ -148,6 +149,32 @@ type SMTPPort25Config struct {
 	MaxMessageBytes int      `yaml:"max_message_bytes"` // default 1048576 (1 MiB)
 }
 
+// TCPJSONReceiverConfig - top-level config for the tcp_json receiver.
+// Multiple listeners are supported, each with their own profile and
+// allowlist. The "port_<n>" naming mirrors SMTPReceiverConfig.Port25.
+type TCPJSONReceiverConfig struct {
+	Port5044 TCPJSONPort5044Config `yaml:"port_5044"`
+}
+
+// TCPJSONPort5044Config - one TCP-JSON listener.
+//
+// Senders typically open a persistent connection and send many
+// newline-delimited JSON messages over it. allowed_ips controls which
+// hosts may connect; rejected connections are logged and closed
+// immediately.
+//
+// profile binds incoming events to a single profile (just like
+// webhook endpoints bind paths to profiles). For different profiles
+// per sender, configure multiple listeners on different ports.
+type TCPJSONPort5044Config struct {
+	Enabled         bool     `yaml:"enabled"`
+	Listen          string   `yaml:"listen"`            // e.g. ":5044"
+	Profile         string   `yaml:"profile"`           // profile to bind events to
+	AllowedIPs      []string `yaml:"allowed_ips"`       // CIDRs; empty = deny all
+	MaxMessageBytes int      `yaml:"max_message_bytes"` // per-line cap; default 1 MiB
+}
+
+
 // TraceConfig controls the trace/capture feature - per-receiver raw-data
 // dump to disk for debugging. Default disabled. Per-receiver toggles
 // independent. When enabled, performance is impacted (synchronous writes).
@@ -169,6 +196,7 @@ type TraceReceiversConfig struct {
 	SyslogUDP TraceAppendConfig    `yaml:"syslog_udp"`
 	SyslogTCP TraceAppendConfig    `yaml:"syslog_tcp"`
 	Webhook   TraceAppendConfig    `yaml:"webhook"`
+	TCPJSON   TraceAppendConfig    `yaml:"tcp_json"`
 }
 
 // TraceSMTPConfig - SMTP traces are one .eml file per message.
@@ -235,9 +263,11 @@ type ProfileConfig struct {
 }
 
 type EntityConfig struct {
-	FromJSON  string `yaml:"from_json"`
-	FromRegex string `yaml:"from_regex"`
-	FromField string `yaml:"from_field"`
+	FromJSON       string `yaml:"from_json"`
+	FromRegex      string `yaml:"from_regex"`
+	FromField      string `yaml:"from_field"`
+	FromJSONString string `yaml:"from_json_string,omitempty"`
+	Select         string `yaml:"select,omitempty"`
 }
 
 type NormalizeConfig struct {

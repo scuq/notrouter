@@ -58,6 +58,18 @@ receivers:
         - "alerts@notrouter.local"
       allowed_from: []
       max_message_bytes: 1048576
+  tcp_json:
+    port_5044:
+      enabled: true
+      listen: ":5044"
+      profile: ansible              # uses the v0.3.4 ansible profile
+      max_message_bytes: 1048576    # 1 MiB per line
+      allowed_ips:
+        - "127.0.0.1/32"
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+
 
 trace:
   enabled: true
@@ -76,6 +88,10 @@ trace:
       max_bytes_per_file: 10485760
       max_files: 3
     webhook:
+      enabled: false
+      max_bytes_per_file: 10485760
+      max_files: 3
+    tcp_json:
       enabled: false
       max_bytes_per_file: 10485760
       max_files: 3
@@ -188,6 +204,37 @@ profiles:
   generic:
     entity:
       from_json: "$.entity"
+
+  ansible:
+    entity:
+      from_json_string: "$.ansible_pre_command_output"
+      select: "$.title"
+
+    normalize:
+      topic: "ansible-recap"
+      # Urgency stays "info" by default. v0.3.5 backlog: derive from
+      # has_failures once we add per-host iteration in v0.3.6.
+      urgency:
+        from_field: "urgency_default"   # never set; stays empty/info
+
+    attributes:
+      title:
+        from_json_string: "$.ansible_pre_command_output"
+        select: "$.title"
+      uri:
+        from_json_string: "$.ansible_pre_command_output"
+        select: "$.uri"
+      repo:
+        from_json_string: "$.ansible_pre_command_output"
+        select: "$.repo"
+      ansible_type:
+        from_json: "$.ansible_type"
+      duration:
+        from_json: "$.ansible_playbook_duration"
+      webui_url:
+        from_json: "$.webui_url"
+      source_kind:
+        static: "ansible"
 
   smtp_generic:
     entity:

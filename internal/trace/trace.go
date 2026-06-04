@@ -37,6 +37,7 @@ type Tracer struct {
 	syslogUDP *appendWriter     // syslog UDP: append-mode JSONL
 	syslogTCP *appendWriter     // syslog TCP: append-mode JSONL
 	webhook   *appendWriter     // webhook: append-mode JSONL
+	tcpJSON   *appendWriter     // tcp_json: append-mode JSONL
 
 	// Track when we last logged a write error per receiver type, so we
 	// don't spam the log on persistent failures (disk full, perm denied).
@@ -117,6 +118,17 @@ func New(cfg config.TraceConfig, log *slog.Logger) (*Tracer, error) {
 		}
 		t.webhook = w
 	}
+	if cfg.Receivers.TCPJSON.Enabled {
+		w, err := newAppendWriter(filepath.Join(outDir, "tcp_json"),
+			"tcp_json",
+			cfg.Receivers.TCPJSON.MaxBytesPerFile,
+			cfg.Receivers.TCPJSON.MaxFiles,
+			log)
+		if err != nil {
+			return nil, fmt.Errorf("trace tcp_json: %w", err)
+		}
+		t.tcpJSON = w
+	}
 
 	t.logEnabledReceivers()
 	t.startPeriodicReminder()
@@ -136,6 +148,9 @@ func (t *Tracer) logEnabledReceivers() {
 	}
 	if t.webhook != nil {
 		enabled = append(enabled, "webhook")
+	}
+	if t.tcpJSON != nil {
+		enabled = append(enabled, "tcp_json")
 	}
 	if len(enabled) == 0 {
 		t.log.Warn("trace is globally enabled but no per-receiver toggles are on - no data will be captured")
@@ -192,6 +207,9 @@ func (t *Tracer) Stop() {
 	if t.webhook != nil {
 		_ = t.webhook.close()
 	}
+	if t.tcpJSON != nil {
+		_ = t.tcpJSON.close()
+	}
 }
 
 // =====================================================================
@@ -245,6 +263,18 @@ func (t *Tracer) CaptureWebhook(method, path, srcIP string, headers map[string][
 	}
 	if err := t.webhook.writeJSONL(webhookRecord(method, path, srcIP, headers, body)); err != nil {
 		t.maybeLogErr("webhook", err)
+	}
+}
+
+// CaptureTCPJSON writes one JSONL trace entry per incoming TCP-JSON
+// line. srcIP is the connection's peer IP. body is the raw JSON-line
+// bytes (without the trailing newline).
+func (t *Tracer) CaptureTCPJSON(srcIP string, body []byte) {
+	if t == nil || t.tcpJSON == nil {
+		return
+	}
+	if err := t.tcpJSON.writeJSONL(syslogRecord(srcIP, body)); err != nil {
+		t.maybeLogErr("tcp_json", err)
 	}
 }
 

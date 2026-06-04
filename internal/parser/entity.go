@@ -17,10 +17,12 @@ import (
 // compiledProfile holds pre-parsed extraction rules for a single profile.
 // Built once at startup; read-only at runtime.
 type compiledProfile struct {
-	name           string
-	entityFromJSON string
-	entityRegex    *regexp.Regexp
-	entityField    string // "hostname" | "src_ip" | "" (for syslog header lookups)
+	name                 string
+	entityFromJSON       string
+	entityRegex          *regexp.Regexp
+	entityField          string // "hostname" | "src_ip" | "" (for syslog header lookups)
+	entityFromJSONString string // outer-JSON path; value is a JSON-encoded string
+	entitySelect         string // sub-path inside the parsed inner JSON
 }
 
 type EntityResolver struct {
@@ -42,9 +44,11 @@ func NewEntityResolver(
 
 	for name, pc := range profileCfgs {
 		cp := &compiledProfile{
-			name:           name,
-			entityFromJSON: pc.Entity.FromJSON,
-			entityField:    pc.Entity.FromField,
+			name:                 name,
+			entityFromJSON:       pc.Entity.FromJSON,
+			entityField:          pc.Entity.FromField,
+			entityFromJSONString: pc.Entity.FromJSONString,
+			entitySelect:         pc.Entity.Select,
 		}
 		if pc.Entity.FromRegex != "" {
 			re, err := regexp.Compile(pc.Entity.FromRegex)
@@ -141,7 +145,18 @@ func (r *EntityResolver) resolve(raw *pipeline.RawEvent) bool {
 		}
 	}
 
-	// 2. Try a named field already in attributes (e.g. parsed syslog hostname).
+	// 2. Try JSON-string deref: read an outer JSON field whose value is
+	//    itself a JSON-encoded string, parse it, then JSONPath into it.
+	//    Used for Logstash-style events where ansible_pre_command_output
+	//    is a JSON string. Mirrors the attribute extractor's behavior.
+	if profile.entityFromJSONString != "" {
+		if entity, ok := extractFromJSONStringEntity(raw.Event.Raw, profile.entityFromJSONString, profile.entitySelect); ok && entity != "" {
+			raw.Event.Entity = entity
+			return true
+		}
+	}
+
+	// 3. Try a named field already in attributes (e.g. parsed syslog hostname).
 	if profile.entityField != "" {
 		if v, ok := raw.Event.Attributes[profile.entityField]; ok && v != "" {
 			raw.Event.Entity = v
@@ -149,7 +164,7 @@ func (r *EntityResolver) resolve(raw *pipeline.RawEvent) bool {
 		}
 	}
 
-	// 3. Try a regex against the raw payload.
+	// 4. Try a regex against the raw payload.
 	if profile.entityRegex != nil {
 		if m := profile.entityRegex.FindSubmatch(raw.Event.Raw); m != nil {
 			// If there's a capturing group, use it; otherwise the whole match.
@@ -249,6 +264,39 @@ func extractFromJSON(raw []byte, path string) (string, bool) {
 		return "", false
 	}
 	return jsonpath.GetString(v, path)
+}
+
+// extractFromJSONStringEntity is the entity-resolver equivalent of the
+// attribute extractor's from_json_string + select. Reads an outer JSON
+// field whose value is a JSON-encoded string, parses it, then extracts
+// a sub-path. Empty select means "return the stringified parsed object"
+// (rarely useful here but symmetric with the attribute version).
+//
+// Returns ("", false) on any failure (outer path miss, inner parse
+// error, inner path miss) - the caller falls through to the next
+// entity strategy.
+func extractFromJSONStringEntity(rawBody []byte, outerPath, selectPath string) (string, bool) {
+	innerRaw, ok := extractFromJSON(rawBody, outerPath)
+	if !ok || innerRaw == "" {
+		return "", false
+	}
+	var inner interface{}
+	if err := json.Unmarshal([]byte(innerRaw), &inner); err != nil {
+		return "", false
+	}
+	if selectPath == "" {
+		if b, err := json.Marshal(inner); err == nil {
+			return string(b), true
+		}
+		return "", false
+	}
+	// inner JSONPath - use jsonpath.GetString for symmetric behavior with
+	// the attribute extractor's stringification of scalar fields.
+	s, ok := jsonpath.GetString(inner, selectPath)
+	if !ok || s == "" {
+		return "", false
+	}
+	return s, true
 }
 
 func truncate(b []byte, n int) string {

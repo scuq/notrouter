@@ -249,6 +249,28 @@ func (p *Pipeline) Start(parent context.Context) error {
 			return fmt.Errorf("smtp-25 receiver start: %w", err)
 		}
 	}
+
+	// TCP-JSON receiver. Disabled by default; only constructed if
+	// receivers.tcp_json.port_5044.enabled = true. Accepts newline-
+	// delimited JSON over a persistent TCP connection. Used by the
+	// community.general.logstash Ansible callback (and any other
+	// json_lines-over-TCP sender) as a Logstash replacement.
+	if p.cfg.Receivers.TCPJSON.Port5044.Enabled {
+		tcpJSONRecv, err := receivers.NewTCPJSON(p.cfg.Receivers.TCPJSON.Port5044, p.pl.RawCh, p.log)
+		if err != nil {
+			p.cancel()
+			p.pl.Wait()
+			closeInstances(p.instances, p.log)
+			return fmt.Errorf("tcp_json receiver: %w", err)
+		}
+		tcpJSONRecv.SetTracer(p.tracer)
+		if err := tcpJSONRecv.Start(p.ctx, &p.ioWg); err != nil {
+			p.cancel()
+			p.pl.Wait()
+			closeInstances(p.instances, p.log)
+			return fmt.Errorf("tcp_json receiver start: %w", err)
+		}
+	}
 	return nil
 }
 

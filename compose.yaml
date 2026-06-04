@@ -11,6 +11,7 @@ services:
       - "2525:2525"
       - "5514:5514/udp"
       - "5514:5514/tcp"
+      - "5044:5044/tcp"
       - "9090:9090"
     volumes:
       - ./config.yaml:/etc/notrouter/config.yaml:ro
