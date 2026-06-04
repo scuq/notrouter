@@ -209,14 +209,10 @@ profiles:
     entity:
       from_json_string: "$.ansible_pre_command_output"
       select: "$.title"
-
     normalize:
       topic: "ansible-recap"
-      # Urgency stays "info" by default. v0.3.5 backlog: derive from
-      # has_failures once we add per-host iteration in v0.3.6.
       urgency:
-        from_field: "urgency_default"   # never set; stays empty/info
-
+        from_field: "urgency_default"
     attributes:
       title:
         from_json_string: "$.ansible_pre_command_output"
@@ -235,6 +231,11 @@ profiles:
         from_json: "$.webui_url"
       source_kind:
         static: "ansible"
+      recap_dots:
+        from_ansible_recap_dots: "$.ansible_result"
+      recap_table:
+        from_ansible_recap_table: "$.ansible_result"
+        host_column_width: 20
 
   smtp_generic:
     entity:
@@ -358,15 +359,45 @@ logging:
   suppressor_log_throttle: 60s
 
 plugin_instances:
+
   webex_noc:
     type: webex
     config:
       webhook_url: "https://webexapis.com/v1/webhooks/incoming/REPLACE_ME"
       timeout: "15s"
       rate_limit_grace: "2s"
+      template: |
+        {{- if eq .Attributes.source_kind "ansible" -}}
+        **🔔 Ansible Play Recap - {{ .Attributes.title }} 🔔**
+ 
+        {{ .Attributes.recap_dots }}
+ 
+        ```text
+        PLAY RECAP ***************************************************************
+        {{ .Attributes.recap_table }}
+        ```
+ 
+        **Duration**: `{{ .Attributes.duration }}` seconds
+        {{- if .Attributes.uri }}
+ 
+        **Link**: [{{ .Attributes.uri }}]({{ .Attributes.uri }})
+        {{- end }}
+        {{- if .Attributes.repo }}
+ 
+        **Repo**: [{{ .Attributes.repo }}]({{ .Attributes.repo }})
+        {{- end }}
+        {{- else -}}
+        {{.Urgency}} · `{{.Entity}}`
+        {{- if .Attributes.msg }} · `{{.Attributes.msg}}`{{- end }}
+        {{- end -}}
+        {{- if or .Attributes.source_kind .Source }}
+ 
+        <small><i>via {{ if .Attributes.source_kind }}{{ .Attributes.source_kind }} · {{ end }}{{ if .Attributes.origin_alias }}{{ .Attributes.origin_alias }} · {{ else if .Attributes.origin_id }}{{ .Attributes.origin_id }} · {{ end }}{{ .Source }}</i></small>
+        {{- end }}
     retry:
       attempts: 5
       backoff: [2s, 5s, 10s, 30s, 60s]
+
 
   file_audit:
     type: file

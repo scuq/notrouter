@@ -270,6 +270,51 @@ func applyAttributeExtractors(extractors map[string]config.AttributeExtractor, j
 				log.Debug("attribute extractor: inner path miss",
 					"key", key, "outer", ex.FromJSONString, "select", ex.Select)
 			}
+
+		case ex.FromAnsibleRecapDots != "":
+			// v0.3.6 - per-host colored-dot list. Reads the JSON-encoded
+			// recap string at FromAnsibleRecapDots, parses it, and renders
+			// one host per line prefixed by 🟢/🔴/🟡 based on failures
+			// and unreachable counts.
+			if jsonVal == nil {
+				log.Debug("attribute extractor: no JSON to extract from",
+					"key", key, "path", ex.FromAnsibleRecapDots)
+				continue
+			}
+			recapStr, ok := jsonpath.GetString(jsonVal, ex.FromAnsibleRecapDots)
+			if !ok || recapStr == "" {
+				log.Debug("attribute extractor: ansible recap path miss",
+					"key", key, "path", ex.FromAnsibleRecapDots)
+				continue
+			}
+			if rendered := renderAnsibleRecapDots(recapStr); rendered != "" {
+				ev.Attributes[key] = rendered
+			} else {
+				log.Debug("attribute extractor: ansible recap parse failed",
+					"key", key)
+			}
+
+		case ex.FromAnsibleRecapTable != "":
+			// v0.3.6 - PLAY RECAP table renderer. Same parse, different
+			// output format. HostColumnWidth controls the host name column
+			// padding; defaults to 20.
+			if jsonVal == nil {
+				log.Debug("attribute extractor: no JSON to extract from",
+					"key", key, "path", ex.FromAnsibleRecapTable)
+				continue
+			}
+			recapStr, ok := jsonpath.GetString(jsonVal, ex.FromAnsibleRecapTable)
+			if !ok || recapStr == "" {
+				log.Debug("attribute extractor: ansible recap path miss",
+					"key", key, "path", ex.FromAnsibleRecapTable)
+				continue
+			}
+			if rendered := renderAnsibleRecapTable(recapStr, ex.HostColumnWidth); rendered != "" {
+				ev.Attributes[key] = rendered
+			} else {
+				log.Debug("attribute extractor: ansible recap parse failed",
+					"key", key)
+			}
 		}
 	}
 }

@@ -287,6 +287,20 @@ type AttributeExtractor struct {
 	Static         string `yaml:"static,omitempty"`
 	FromJSONString string `yaml:"from_json_string,omitempty"`
 	Select         string `yaml:"select,omitempty"`
+
+	// v0.3.6 - Ansible-specific recap formatters. Each reads a path
+	// where the value is a JSON-encoded string of host -> stats,
+	// parses it, and renders a pre-formatted multi-line string.
+	// Deliberately special-case: avoids needing object-typed event
+	// attributes for a single vendor. If a second vendor needs
+	// similar iteration, consider generalizing.
+	FromAnsibleRecapDots  string `yaml:"from_ansible_recap_dots,omitempty"`
+	FromAnsibleRecapTable string `yaml:"from_ansible_recap_table,omitempty"`
+
+	// HostColumnWidth controls the padding for the host column in the
+	// table renderer. Defaults to 20 (matches the Python forwarder).
+	// Only relevant for from_ansible_recap_table.
+	HostColumnWidth int `yaml:"host_column_width,omitempty"`
 }
 
 type DedupConfig struct {
