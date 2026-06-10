@@ -6,6 +6,7 @@ require (
 	github.com/emersion/go-smtp v0.24.0
 	github.com/prometheus/client_golang v1.20.5
 	golang.org/x/crypto v0.28.0
+	golang.org/x/text v0.19.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

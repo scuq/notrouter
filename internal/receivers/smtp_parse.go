@@ -3,6 +3,8 @@ package receivers
 import (
 	"bytes"
 	"encoding/base64"
+	"golang.org/x/text/encoding/htmlindex"
+	"golang.org/x/text/transform"
 	"fmt"
 	"io"
 	"mime"
@@ -63,7 +65,7 @@ func parseEmail(raw []byte) (parsedEmail, error) {
 	} else {
 		// Single-part message. Decode by Content-Transfer-Encoding and
 		// route to bodyText or bodyHTML based on Content-Type.
-		decoded := decodeBody(msg.Body, msg.Header.Get("Content-Transfer-Encoding"))
+		decoded := decodeBody(msg.Body, msg.Header.Get("Content-Transfer-Encoding"), params["charset"])
 		if strings.HasPrefix(mediaType, "text/html") {
 			out.bodyHTML = decoded
 		} else {
@@ -128,9 +130,9 @@ func walkMultipart(body io.Reader, boundary string, out *parsedEmail, depth int)
 
 		switch {
 		case strings.HasPrefix(mediaType, "text/plain") && out.bodyText == "":
-			out.bodyText = decodeBody(part, part.Header.Get("Content-Transfer-Encoding"))
+			out.bodyText = decodeBody(part, part.Header.Get("Content-Transfer-Encoding"), params["charset"])
 		case strings.HasPrefix(mediaType, "text/html") && out.bodyHTML == "":
-			out.bodyHTML = decodeBody(part, part.Header.Get("Content-Transfer-Encoding"))
+			out.bodyHTML = decodeBody(part, part.Header.Get("Content-Transfer-Encoding"), params["charset"])
 		}
 		_ = part.Close()
 
@@ -143,27 +145,44 @@ func walkMultipart(body io.Reader, boundary string, out *parsedEmail, depth int)
 // decodeBody applies Content-Transfer-Encoding decoding and returns
 // the body as a string. Failures fall back to raw bytes - we'd rather
 // surface garbled text than no text.
-func decodeBody(r io.Reader, encoding string) string {
+func decodeBody(r io.Reader, encoding, charset string) string {
 	encoding = strings.ToLower(strings.TrimSpace(encoding))
+	var raw []byte
 	switch encoding {
 	case "quoted-printable":
-		decoded, err := io.ReadAll(quotedprintable.NewReader(r))
-		if err != nil {
-			// Read whatever we got even on error.
-			return string(decoded)
-		}
-		return string(decoded)
+		raw, _ = io.ReadAll(quotedprintable.NewReader(r))
 	case "base64":
-		// Base64 decoder needs the full input first.
-		raw, _ := io.ReadAll(r)
-		// mime/quotedprintable handles Q-P; for base64 use encoding/base64.
-		// Inlined to keep imports tight.
-		return decodeBase64(string(raw))
+		b64raw, _ := io.ReadAll(r)
+		raw = []byte(decodeBase64(string(b64raw)))
 	default:
 		// "7bit", "8bit", "binary", or unspecified - read as-is.
-		raw, _ := io.ReadAll(r)
+		raw, _ = io.ReadAll(r)
+	}
+	return applyCharset(raw, charset)
+}
+
+// applyCharset converts raw bytes from the declared charset to UTF-8.
+// Empty charset, UTF-8, or US-ASCII pass through unchanged. Unknown
+// charset names fall back to raw bytes - garbled-but-something is
+// better than empty.
+//
+// Uses htmlindex which understands all RFC-named charsets:
+// Windows-1252, ISO-8859-1, ISO-8859-15, UTF-16, Shift_JIS, etc.
+func applyCharset(raw []byte, charset string) string {
+	cs := strings.ToLower(strings.TrimSpace(charset))
+	if cs == "" || cs == "utf-8" || cs == "utf8" || cs == "us-ascii" || cs == "ascii" {
 		return string(raw)
 	}
+	enc, err := htmlindex.Get(cs)
+	if err != nil {
+		// Unknown charset. Return raw bytes; mojibake beats empty.
+		return string(raw)
+	}
+	utf8Bytes, _, err := transform.Bytes(enc.NewDecoder(), raw)
+	if err != nil {
+		return string(raw)
+	}
+	return string(utf8Bytes)
 }
 
 // decodeBase64 strips whitespace and decodes. base64 in MIME bodies
